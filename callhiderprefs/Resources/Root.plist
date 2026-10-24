@@ -1,0 +1,91 @@
+{
+    items = (
+        {
+            cell = PSGroupCell;
+            label = Behaviour;
+            footerText = "Hidden callers still ring through at the system level (they can leave voicemail). Your phone just won't light up, show a banner, or make a sound \U2014 only the red icon appears.";
+        },
+        {
+            cell = PSSwitchCell;
+            label = "Enable CallHider";
+            key = enabled;
+            default = 1;
+            defaults = com.cobradarsh.callhider;
+            PostNotification = "com.cobradarsh.callhider/reload";
+        },
+        {
+            cell = PSSwitchCell;
+            label = "Silence ring & vibration";
+            key = silenceRinger;
+            default = 1;
+            defaults = com.cobradarsh.callhider;
+            PostNotification = "com.cobradarsh.callhider/reload";
+        },
+        {
+            cell = PSSwitchCell;
+            label = "Keep screen from waking";
+            key = suppressWake;
+            default = 1;
+            defaults = com.cobradarsh.callhider;
+            PostNotification = "com.cobradarsh.callhider/reload";
+        },
+        {
+            cell = PSSwitchCell;
+            label = "Hide on-screen call UI";
+            key = suppressUI;
+            default = 1;
+            defaults = com.cobradarsh.callhider;
+            PostNotification = "com.cobradarsh.callhider/reload";
+        },
+        {
+            cell = PSSwitchCell;
+            label = "Tap red icon to answer";
+            key = tapToAnswer;
+            default = 0;
+            defaults = com.cobradarsh.callhider;
+            PostNotification = "com.cobradarsh.callhider/reload";
+        },
+        {
+            cell = PSGroupCell;
+            label = Indicator;
+            footerText = "Drag the red icon anywhere on screen while a hidden call is active \U2014 its position is saved automatically.";
+        },
+        {
+            cell = PSSliderCell;
+            key = iconSize;
+            default = 44;
+            min = 30;
+            max = 70;
+            defaults = com.cobradarsh.callhider;
+            PostNotification = "com.cobradarsh.callhider/reload";
+        },
+        {
+            cell = PSButtonCell;
+            label = "Reset icon to top-right";
+            action = resetIconPosition;
+        },
+        {
+            cell = PSGroupCell;
+            label = "Hidden callers";
+        },
+        {
+            cell = PSLinkCell;
+            label = "Manage hidden contacts";
+            detail = CHContactsController;
+            isController = 1;
+        },
+        {
+            cell = PSGroupCell;
+            label = Advanced;
+        },
+        {
+            cell = PSSwitchCell;
+            label = "Debug logging";
+            key = debugLog;
+            default = 0;
+            defaults = com.cobradarsh.callhider;
+            PostNotification = "com.cobradarsh.callhider/reload";
+        }
+    );
+    title = CallHider;
+}

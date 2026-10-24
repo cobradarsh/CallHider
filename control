@@ -1,0 +1,9 @@
+Package: com.cobradarsh.callhider
+Name: CallHider
+Version: 1.0.0
+Architecture: iphoneos-arm64
+Description: Silently hide incoming calls (cellular and VoIP) from selected contacts behind a movable red indicator — no screen wake, no banner, no ring.
+Maintainer: cobradarsh
+Author: cobradarsh
+Section: Tweaks
+Depends: mobilesubstrate, preferenceloader, firmware (>= 16.0)

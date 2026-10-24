@@ -1,0 +1,29 @@
+#import "CHRootListController.h"
+#import <notify.h>
+#import "../CHPrefs.h"
+
+@implementation CHRootListController
+
+- (NSArray *)specifiers {
+    if (!_specifiers) {
+        _specifiers = [self loadSpecifiersFromPlistName:@"Root" target:self];
+    }
+    return _specifiers;
+}
+
+- (void)resetIconPosition {
+    CFPreferencesSetValue((__bridge CFStringRef)kCHIconX, NULL,
+        (__bridge CFStringRef)kCHAppID, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+    CFPreferencesSetValue((__bridge CFStringRef)kCHIconY, NULL,
+        (__bridge CFStringRef)kCHAppID, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+    CFPreferencesAppSynchronize((__bridge CFStringRef)kCHAppID);
+    notify_post(kCHReloadNotify);
+
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Icon reset"
+        message:@"The red icon will return to the top-right on the next hidden call."
+        preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+@end

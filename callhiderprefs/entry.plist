@@ -1,0 +1,10 @@
+{
+    entry = {
+        bundle = CallHiderPrefs;
+        cell = PSLinkCell;
+        detail = CHRootListController;
+        icon = icon.png;
+        isController = 1;
+        label = CallHider;
+    };
+}
