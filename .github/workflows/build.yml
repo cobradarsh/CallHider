@@ -13,6 +13,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Install build tools (ldid, dpkg)
+        run: |
+          set -e
+          brew update >/dev/null || true
+          brew install ldid dpkg make || brew install ldid dpkg
+          echo "ldid: $(command -v ldid)"
+          echo "dpkg-deb: $(command -v dpkg-deb)"
+
       - name: Install Theos (roothide fork)
         run: |
           set -e
@@ -25,26 +33,34 @@ jobs:
           set -e
           curl -L https://github.com/theos/sdks/archive/refs/heads/master.tar.gz | tar -xz
           mkdir -p "$THEOS/sdks"
-          # Keep a couple of recent SDKs; TARGET in the Makefile selects 16.5.
-          cp -r sdks-master/iPhoneOS16.5.sdk "$THEOS/sdks/" 2>/dev/null || true
-          cp -r sdks-master/iPhoneOS16.4.sdk "$THEOS/sdks/" 2>/dev/null || true
-          ls "$THEOS/sdks"
+          cp -a sdks-master/iPhoneOS16.5.sdk "$THEOS/sdks/"
+          cp -a sdks-master/iPhoneOS15.6.sdk "$THEOS/sdks/" || true
+          echo "SDKs installed:"; ls "$THEOS/sdks"
+          test -d "$THEOS/sdks/iPhoneOS16.5.sdk" || { echo "::error::iPhoneOS16.5.sdk missing"; exit 1; }
 
       - name: Build package
         run: |
-          set -e
+          set -o pipefail
           make clean || true
-          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=roothide
-          ls -l packages
+          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=roothide 2>&1 | tee build.log
+          echo "--- packages ---"; ls -l packages
+
+      - name: Upload build log (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
 
       - name: Upload .deb artifact
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: CallHider-deb
           path: packages/*.deb
 
       - name: Attach .deb to Release (on tag)
-        if: startsWith(github.ref, 'refs/tags/')
+        if: success() && startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: packages/*.deb
