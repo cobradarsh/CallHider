@@ -65,6 +65,11 @@
             action = resetIconPosition;
         },
         {
+            cell = PSButtonCell;
+            label = "Flash test icon (5s)";
+            action = flashTestIcon;
+        },
+        {
             cell = PSGroupCell;
             label = "Hidden callers";
         },
@@ -76,15 +81,14 @@
         },
         {
             cell = PSGroupCell;
-            label = Advanced;
+            label = Diagnostics;
+            footerText = "If calls aren't being hidden, open this and follow the steps. It records what the tweak sees for each incoming call.";
         },
         {
-            cell = PSSwitchCell;
-            label = "Debug logging";
-            key = debugLog;
-            default = 0;
-            defaults = com.cobradarsh.callhider;
-            PostNotification = "com.cobradarsh.callhider/reload";
+            cell = PSLinkCell;
+            label = "Show diagnostics log";
+            detail = CHDiagController;
+            isController = 1;
         }
     );
     title = CallHider;

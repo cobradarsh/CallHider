@@ -3,6 +3,13 @@
 
 #define kCHAppID            @"com.cobradarsh.callhider"
 #define kCHReloadNotify     "com.cobradarsh.callhider/reload"
+#define kCHTestIconNotify   "com.cobradarsh.callhider/testicon"
+#define kCHClearLogNotify   "com.cobradarsh.callhider/clearlog"
+
+// On-device diagnostics, written by the tweak (SpringBoard) and read by the
+// Settings bundle. /var/mobile is shared between both processes.
+#define kCHDiagDir          @"/var/mobile/Library/CallHider"
+#define kCHDiagPath         @"/var/mobile/Library/CallHider/diag.log"
 
 // Behaviour
 #define kCHEnabled          @"enabled"          // master on/off           (default YES)
