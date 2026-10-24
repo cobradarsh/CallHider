@@ -1,0 +1,7 @@
+# Keep build-critical files LF so they work on macOS / CI regardless of host.
+*            text=auto
+Makefile     text eol=lf
+*.mk         text eol=lf
+*.yml        text eol=lf
+*.plist      text eol=lf
+*.sh         text eol=lf
