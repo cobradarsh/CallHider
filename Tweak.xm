@@ -34,6 +34,7 @@
 @property (nonatomic, readonly, copy) NSString *contactIdentifier;
 @property (nonatomic, readonly, copy) NSString *displayName;
 @property (nonatomic, readonly, copy) NSString *callUUID;
+- (void)setShouldSuppressRingtone:(BOOL)v;   // exists at runtime (readwrite property)
 @end
 
 @interface TUCallCenter : NSObject
@@ -311,7 +312,7 @@ static void CHHideIcon(void) {
         gIsSpringBoard = [gProc isEqualToString:@"SpringBoard"];
         gRevealed = [NSSet set];
         CHReload();
-        CHDiag(@"CallHider v1.1.1 loaded in %@ (springboard=%d)", gProc, gIsSpringBoard);
+        CHDiag(@"CallHider v1.1.2 loaded in %@ (springboard=%d)", gProc, gIsSpringBoard);
 
         %init(_ungrouped);
         if (gIsSpringBoard) %init(SpringBoardGroup);
