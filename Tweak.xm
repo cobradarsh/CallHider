@@ -130,8 +130,8 @@ static BOOL CHObjHidden(id call) {
         if (uuid && [gRevealed containsObject:uuid]) return NO;
         if ([call respondsToSelector:@selector(contactIdentifier)]) cid  = [call contactIdentifier];
         if ([call respondsToSelector:@selector(handle)]) {
-            id h = [call handle];
-            if ([h respondsToSelector:@selector(value)]) num = CHNormalizeNumber([h value]);
+            TUHandle *h = (TUHandle *)[call handle];
+            if ([h respondsToSelector:@selector(value)]) num = CHNormalizeNumber(h.value);
         }
         return CHMatchNumbersOrId(cid, num);
     } @catch (__unused NSException *e) { return NO; }
@@ -312,7 +312,7 @@ static void CHHideIcon(void) {
         gIsSpringBoard = [gProc isEqualToString:@"SpringBoard"];
         gRevealed = [NSSet set];
         CHReload();
-        CHDiag(@"CallHider v1.1.2 loaded in %@ (springboard=%d)", gProc, gIsSpringBoard);
+        CHDiag(@"CallHider v1.1.3 loaded in %@ (springboard=%d)", gProc, gIsSpringBoard);
 
         %init(_ungrouped);
         if (gIsSpringBoard) %init(SpringBoardGroup);
