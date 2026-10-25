@@ -5,6 +5,7 @@
 #define kCHReloadNotify     "com.cobradarsh.callhider/reload"
 #define kCHTestIconNotify   "com.cobradarsh.callhider/testicon"
 #define kCHClearLogNotify   "com.cobradarsh.callhider/clearlog"
+#define kCHClearMissedNotify "com.cobradarsh.callhider/clearmissed"
 
 // On-device diagnostics, written by the tweak (SpringBoard) and read by the
 // Settings bundle. /var/mobile is shared between both processes.
@@ -17,12 +18,14 @@
 #define kCHSuppressWake     @"suppressWake"     // keep screen from waking  (default YES)
 #define kCHSuppressUI       @"suppressUI"       // no banner / no full UI    (default YES)
 #define kCHTapToAnswer      @"tapToAnswer"      // tap red icon answers call (default NO)
+#define kCHHideMissedNotif  @"hideMissedNotif"  // drop missed-call lockscreen notification (default YES)
 #define kCHDebugLog         @"debugLog"         //                           (default NO)
 
 // Indicator
 #define kCHIconX            @"iconX"            // CGFloat, screen point
 #define kCHIconY            @"iconY"
-#define kCHIconSize         @"iconSize"         // CGFloat diameter (default 44)
+#define kCHIconSize         @"iconSize"         // CGFloat diameter (default 30)
+#define kCHMissedCount      @"missedCount"      // unseen missed hidden calls (persisted)
 
 // Hidden callers: array of dictionaries, each:
 //   { "id": <CNContact identifier>, "name": <display>, "numbers": [<normalized digit strings>] }

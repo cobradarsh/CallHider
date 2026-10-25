@@ -37,4 +37,25 @@
     [self presentViewController:a animated:YES completion:nil];
 }
 
+- (void)clearMissedIndicator {
+    CFPreferencesSetValue((__bridge CFStringRef)kCHMissedCount, (__bridge CFNumberRef)@(0),
+        (__bridge CFStringRef)kCHAppID, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+    CFPreferencesAppSynchronize((__bridge CFStringRef)kCHAppID);
+    notify_post(kCHClearMissedNotify);
+}
+
+- (void)clearHiddenCallers {
+    UIAlertController *c = [UIAlertController alertControllerWithTitle:@"Clear hidden callers?"
+        message:@"This removes every contact from your hidden list. Calls from them will no longer be hidden."
+        preferredStyle:UIAlertControllerStyleAlert];
+    [c addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [c addAction:[UIAlertAction actionWithTitle:@"Clear" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a){
+        CFPreferencesSetValue((__bridge CFStringRef)kCHHiddenContacts, (__bridge CFArrayRef)@[],
+            (__bridge CFStringRef)kCHAppID, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+        CFPreferencesAppSynchronize((__bridge CFStringRef)kCHAppID);
+        notify_post(kCHReloadNotify);
+    }]];
+    [self presentViewController:c animated:YES completion:nil];
+}
+
 @end

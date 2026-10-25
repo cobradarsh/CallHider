@@ -39,6 +39,14 @@
         },
         {
             cell = PSSwitchCell;
+            label = "Hide missed-call notification";
+            key = hideMissedNotif;
+            default = 1;
+            defaults = com.cobradarsh.callhider;
+            PostNotification = "com.cobradarsh.callhider/reload";
+        },
+        {
+            cell = PSSwitchCell;
             label = "Tap red icon to answer";
             key = tapToAnswer;
             default = 0;
@@ -53,9 +61,9 @@
         {
             cell = PSSliderCell;
             key = iconSize;
-            default = 44;
-            min = 30;
-            max = 70;
+            default = 30;
+            min = 20;
+            max = 60;
             defaults = com.cobradarsh.callhider;
             PostNotification = "com.cobradarsh.callhider/reload";
         },
@@ -70,14 +78,25 @@
             action = flashTestIcon;
         },
         {
+            cell = PSButtonCell;
+            label = "Clear hidden-call indicator";
+            action = clearMissedIndicator;
+        },
+        {
             cell = PSGroupCell;
             label = "Hidden callers";
+            footerText = "The red icon stays on screen after a missed hidden call (with a count) until you tap it or clear it above.";
         },
         {
             cell = PSLinkCell;
             label = "Manage hidden contacts";
             detail = CHContactsController;
             isController = 1;
+        },
+        {
+            cell = PSButtonCell;
+            label = "Clear hidden callers list";
+            action = clearHiddenCallers;
         },
         {
             cell = PSGroupCell;

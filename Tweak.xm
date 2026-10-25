@@ -1,51 +1,58 @@
 // CallHider — hide incoming calls (cellular + VoIP) from selected contacts.
 //
-// v1.1.1 notes (from on-device diagnostics of v1.1.0):
-//   * Contact matching works (handle/contactIdentifier -> hidden=1). Good.
-//   * SpringBoard crashed into safe mode at call status 4 (actively ringing).
-//     The only call that does anything during a live ring is -suppressRingtone,
-//     so that is removed. Ringtone is now silenced ONLY via the writable
-//     -shouldSuppressRingtone property (getter forced + setter), which is safe.
-//   * The presentation hook never logged, i.e. the guessed selector never fired.
-//     It now logs the moment it runs and does NOT swallow the request this build
-//     (so it can't destabilise SpringBoard) — purely to confirm whether/when it
-//     fires, so the next build can target the real presentation path.
-//   * Every suppression step is individually logged; if anything still trips,
-//     the LAST line in Diagnostics names the exact step.
-//   * The screen-wake block now keys off a cached flag (no call-center query on
-//     the backlight path) and logs before it acts.
+// v1.2.0 (all mechanisms confirmed firing on-device via diagnostics):
+//   * Ringtone silenced via -shouldSuppressRingtone (safe getter/setter).
+//   * Screen wake blocked via SBBacklightController while a hidden call rings.
+//   * On-screen call UI suppressed by swallowing the SBInCallPresentationManager
+//     presentation request (PRES-HOOK, proven to fire) — completion is still
+//     called so the client isn't left hanging. Gated by "Hide on-screen call UI".
+//   * Missed-call lockscreen notification dropped at BBServer for hidden callers
+//     (matched by the bulletin's BBContact cnContactIdentifier / handle).
+//   * Small red phone glyph indicator that PERSISTS after a missed hidden call
+//     (with a count badge) until cleared; tap clears it (or answers while ringing).
 
 #import <UIKit/UIKit.h>
 #import <notify.h>
 #import <objc/runtime.h>
 #import "CHPrefs.h"
 
-#pragma mark - Private interfaces (iOS 16 runtime headers)
+#pragma mark - Private interfaces
 
 @interface TUHandle : NSObject
 @property (nonatomic, readonly, copy) NSString *value;
 @end
-
 @interface TUCall : NSObject
 @property (nonatomic, readonly) int callStatus;
 @property (getter=isIncoming, nonatomic, readonly) BOOL incoming;
-@property (getter=isVoIPCall, nonatomic, readonly) BOOL voipCall;
 @property (nonatomic, readonly) TUHandle *handle;
 @property (nonatomic, readonly, copy) NSString *contactIdentifier;
 @property (nonatomic, readonly, copy) NSString *displayName;
 @property (nonatomic, readonly, copy) NSString *callUUID;
-- (void)setShouldSuppressRingtone:(BOOL)v;   // exists at runtime (readwrite property)
+- (void)setShouldSuppressRingtone:(BOOL)v;
 @end
-
 @interface TUCallCenter : NSObject
 + (instancetype)sharedInstance;
-@property (nonatomic, readonly, copy) NSArray *currentCalls;
 - (void)answerCall:(TUCall *)call;
 @end
-
 @interface SBBacklightController : NSObject
-+ (id)sharedInstance;
 - (void)turnOnScreenFullyWithBacklightSource:(long long)source;
+@end
+
+// BulletinBoard (for dropping the missed-call notification)
+@interface BBContact : NSObject
+@property (nonatomic, readonly, copy) NSString *cnContactIdentifier;
+@property (nonatomic, readonly, copy) NSString *handle;
+@property (nonatomic, readonly, copy) NSString *displayName;
+@end
+@interface BBCommunicationContext : NSObject
+@property (nonatomic, readonly, copy) BBContact *sender;
+@end
+@interface BBBulletinRequest : NSObject
+@property (nonatomic, copy) NSString *sectionID;
+@property (nonatomic, copy) NSString *title;
+@property (nonatomic, copy) NSString *subtitle;
+@property (nonatomic, copy) NSString *message;
+@property (nonatomic, retain) BBCommunicationContext *communicationContext;
 @end
 
 #pragma mark - State
@@ -53,61 +60,61 @@
 static BOOL gIsSpringBoard = NO;
 static NSString *gProc = nil;
 static NSDictionary *gPrefs = nil;
-static NSSet<NSString *> *gRevealed;        // call UUIDs the user chose to reveal
-static volatile BOOL gHiddenRinging = NO;   // a hidden call is ringing right now
+static NSSet<NSString *> *gRevealed;
+static volatile BOOL gHiddenRinging = NO;
+static NSInteger gMissedCount = 0;        // persistent "you had a hidden call" count
 
-#pragma mark - Diagnostics (file shared with the Settings bundle)
+#pragma mark - Diagnostics
 
 static void CHDiag(NSString *fmt, ...) {
     va_list args; va_start(args, fmt);
-    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:args];
-    va_end(args);
+    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:args]; va_end(args);
     NSString *line = [NSString stringWithFormat:@"%@  [%@] %@\n",
-        [NSDateFormatter localizedStringFromDate:[NSDate date]
-            dateStyle:NSDateFormatterShortStyle timeStyle:NSDateFormatterMediumStyle],
+        [NSDateFormatter localizedStringFromDate:[NSDate date] dateStyle:NSDateFormatterShortStyle timeStyle:NSDateFormatterMediumStyle],
         gProc ?: @"?", msg];
     NSLog(@"[CallHider] %@", msg);
     @try {
         NSFileManager *fm = [NSFileManager defaultManager];
-        if (![fm fileExistsAtPath:kCHDiagDir])
-            [fm createDirectoryAtPath:kCHDiagDir withIntermediateDirectories:YES attributes:nil error:nil];
-        NSDictionary *at = [fm attributesOfItemAtPath:kCHDiagPath error:nil];
-        if ([at fileSize] > 64*1024) [fm removeItemAtPath:kCHDiagPath error:nil];
+        if (![fm fileExistsAtPath:kCHDiagDir]) [fm createDirectoryAtPath:kCHDiagDir withIntermediateDirectories:YES attributes:nil error:nil];
+        if ([[fm attributesOfItemAtPath:kCHDiagPath error:nil] fileSize] > 64*1024) [fm removeItemAtPath:kCHDiagPath error:nil];
         NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kCHDiagPath];
         if (!fh) { [line writeToFile:kCHDiagPath atomically:YES encoding:NSUTF8StringEncoding error:nil]; return; }
-        [fh seekToEndOfFile];
-        [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
-        [fh closeFile];
+        [fh seekToEndOfFile]; [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile];
     } @catch (__unused NSException *e) {}
 }
 
 #pragma mark - Preferences
 
-static BOOL CHBool(NSString *key, BOOL def) { id v = gPrefs[key]; return (v==nil)?def:[v boolValue]; }
-static CGFloat CHFloat(NSString *key, CGFloat def) { id v = gPrefs[key]; return (v==nil)?def:[v doubleValue]; }
-#define CHEnabled()       CHBool(kCHEnabled, YES)
-#define CHSilenceRinger() CHBool(kCHSilenceRinger, YES)
-#define CHSuppressWake()  CHBool(kCHSuppressWake, YES)
-#define CHSuppressUI()    CHBool(kCHSuppressUI, YES)
-#define CHTapToAnswer()   CHBool(kCHTapToAnswer, NO)
+static BOOL CHBool(NSString *k, BOOL d) { id v = gPrefs[k]; return (v==nil)?d:[v boolValue]; }
+static CGFloat CHFloat(NSString *k, CGFloat d) { id v = gPrefs[k]; return (v==nil)?d:[v doubleValue]; }
+#define CHEnabled()        CHBool(kCHEnabled, YES)
+#define CHSilenceRinger()  CHBool(kCHSilenceRinger, YES)
+#define CHSuppressWake()   CHBool(kCHSuppressWake, YES)
+#define CHSuppressUI()     CHBool(kCHSuppressUI, YES)
+#define CHTapToAnswer()    CHBool(kCHTapToAnswer, NO)
+#define CHHideMissed()     CHBool(kCHHideMissedNotif, YES)
+
+static void CHPersistMissed(void) {
+    CFPreferencesSetValue((__bridge CFStringRef)kCHMissedCount, (__bridge CFNumberRef)@(gMissedCount),
+        (__bridge CFStringRef)kCHAppID, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+    CFPreferencesAppSynchronize((__bridge CFStringRef)kCHAppID);
+}
 
 static void CHReload(void) {
     CFPreferencesAppSynchronize((__bridge CFStringRef)kCHAppID);
-    NSArray *keys = @[kCHEnabled, kCHSilenceRinger, kCHSuppressWake, kCHSuppressUI,
-                      kCHTapToAnswer, kCHIconX, kCHIconY, kCHIconSize, kCHHiddenContacts];
+    NSArray *keys = @[kCHEnabled, kCHSilenceRinger, kCHSuppressWake, kCHSuppressUI, kCHTapToAnswer,
+                      kCHHideMissedNotif, kCHIconX, kCHIconY, kCHIconSize, kCHMissedCount, kCHHiddenContacts];
     NSMutableDictionary *d = [NSMutableDictionary dictionary];
     for (NSString *k in keys) {
-        id v = (__bridge_transfer id)CFPreferencesCopyValue(
-            (__bridge CFStringRef)k, (__bridge CFStringRef)kCHAppID,
-            kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+        id v = (__bridge_transfer id)CFPreferencesCopyValue((__bridge CFStringRef)k, (__bridge CFStringRef)kCHAppID, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
         if (v) d[k] = v;
     }
     gPrefs = [d copy];
-    CHDiag(@"prefs reloaded: enabled=%d hidden=%lu", CHEnabled(),
-           (unsigned long)[gPrefs[kCHHiddenContacts] count]);
+    gMissedCount = [gPrefs[kCHMissedCount] integerValue];
+    CHDiag(@"prefs reloaded: enabled=%d hidden=%lu missed=%ld", CHEnabled(), (unsigned long)[gPrefs[kCHHiddenContacts] count], (long)gMissedCount);
 }
 
-#pragma mark - Matching (fully guarded: call-center arrays may hold proxy objects)
+#pragma mark - Matching
 
 static BOOL CHMatchNumbersOrId(NSString *cid, NSString *num) {
     NSArray *hidden = gPrefs[kCHHiddenContacts];
@@ -126,9 +133,9 @@ static BOOL CHObjHidden(id call) {
     if (!CHEnabled() || !call) return NO;
     @try {
         NSString *uuid = nil, *cid = nil, *num = nil;
-        if ([call respondsToSelector:@selector(callUUID)])          uuid = [call callUUID];
+        if ([call respondsToSelector:@selector(callUUID)]) uuid = [call callUUID];
         if (uuid && [gRevealed containsObject:uuid]) return NO;
-        if ([call respondsToSelector:@selector(contactIdentifier)]) cid  = [call contactIdentifier];
+        if ([call respondsToSelector:@selector(contactIdentifier)]) cid = [call contactIdentifier];
         if ([call respondsToSelector:@selector(handle)]) {
             TUHandle *h = (TUHandle *)[call handle];
             if ([h respondsToSelector:@selector(value)]) num = CHNormalizeNumber(h.value);
@@ -137,10 +144,28 @@ static BOOL CHObjHidden(id call) {
     } @catch (__unused NSException *e) { return NO; }
 }
 
+// Name-string match for a bulletin whose fields are plain text.
+static BOOL CHTextMatchesHidden(NSString *text) {
+    if (![text isKindOfClass:[NSString class]] || text.length == 0) return NO;
+    NSArray *hidden = gPrefs[kCHHiddenContacts];
+    if (![hidden isKindOfClass:[NSArray class]]) return NO;
+    NSString *numInText = CHNormalizeNumber(text);
+    for (NSDictionary *e in hidden) {
+        if (![e isKindOfClass:[NSDictionary class]]) continue;
+        NSString *name = e[kCHEntryName];
+        if ([name isKindOfClass:[NSString class]] && name.length &&
+            [text rangeOfString:name options:NSCaseInsensitiveSearch].location != NSNotFound) return YES;
+        if (numInText.length) for (NSString *n in e[kCHEntryNumbers])
+            if ([n isKindOfClass:[NSString class]] && n.length && ([numInText hasSuffix:n] || [n hasSuffix:numInText])) return YES;
+    }
+    return NO;
+}
+
 #pragma mark - Red indicator window (SpringBoard only)
 
 @interface CHIndicatorWindow : UIWindow
 @property (nonatomic, strong) UIButton *button;
+@property (nonatomic, strong) UILabel *badge;
 @property (nonatomic, weak)   id call;
 @end
 
@@ -153,34 +178,54 @@ static BOOL CHObjHidden(id call) {
 - (instancetype)init {
     UIWindowScene *scene = nil;
     for (UIScene *s in UIApplication.sharedApplication.connectedScenes)
-        if ([s isKindOfClass:[UIWindowScene class]] &&
-            s.activationState == UISceneActivationStateForegroundActive) { scene = (UIWindowScene *)s; break; }
-    if (scene) self = [super initWithWindowScene:scene];
-    else       self = [super initWithFrame:UIScreen.mainScreen.bounds];
+        if ([s isKindOfClass:[UIWindowScene class]] && s.activationState == UISceneActivationStateForegroundActive) { scene = (UIWindowScene *)s; break; }
+    if (scene) self = [super initWithWindowScene:scene]; else self = [super initWithFrame:UIScreen.mainScreen.bounds];
     if (!self) return nil;
     self.windowLevel = UIWindowLevelAlert + 2000;
     self.backgroundColor = UIColor.clearColor; self.hidden = YES;
     self.rootViewController = [UIViewController new];
     self.rootViewController.view.backgroundColor = UIColor.clearColor;
-    CGFloat size = CHFloat(kCHIconSize, 44);
+
     _button = [UIButton buttonWithType:UIButtonTypeCustom];
-    _button.frame = CGRectMake(0,0,size,size);
-    _button.backgroundColor = [UIColor colorWithRed:0.86 green:0.15 blue:0.15 alpha:1.0];
-    _button.layer.cornerRadius = size/2.0;
-    _button.layer.shadowColor = UIColor.blackColor.CGColor; _button.layer.shadowOpacity = 0.35;
-    _button.layer.shadowRadius = 4; _button.layer.shadowOffset = CGSizeMake(0,1);
-    _button.tintColor = UIColor.whiteColor;
-    [_button setImage:[UIImage systemImageNamed:@"phone.fill"] forState:UIControlStateNormal];
     [_button addTarget:self action:@selector(tapped) forControlEvents:UIControlEventTouchUpInside];
     [_button addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(panned:)]];
     [self.rootViewController.view addSubview:_button];
+
+    _badge = [[UILabel alloc] init];
+    _badge.backgroundColor = [UIColor colorWithRed:0.80 green:0.12 blue:0.12 alpha:1.0];
+    _badge.textColor = UIColor.whiteColor;
+    _badge.font = [UIFont boldSystemFontOfSize:11];
+    _badge.textAlignment = NSTextAlignmentCenter;
+    _badge.clipsToBounds = YES; _badge.hidden = YES;
+    [_button addSubview:_badge];
+
+    [self styleButton];
     [self restorePosition];
     return self;
 }
+- (void)styleButton {
+    CGFloat size = CHFloat(kCHIconSize, 30);
+    _button.bounds = CGRectMake(0,0,size,size);
+    // A small white dot so the red glyph stays visible on any wallpaper.
+    _button.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.92];
+    _button.layer.cornerRadius = size/2.0;
+    _button.layer.shadowColor = UIColor.blackColor.CGColor; _button.layer.shadowOpacity = 0.35;
+    _button.layer.shadowRadius = 3; _button.layer.shadowOffset = CGSizeMake(0,1);
+    _button.tintColor = [UIColor colorWithRed:0.86 green:0.15 blue:0.15 alpha:1.0]; // red phone glyph
+    UIImageConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:size*0.52 weight:UIImageSymbolWeightSemibold];
+    [_button setImage:[UIImage systemImageNamed:@"phone.fill" withConfiguration:cfg] forState:UIControlStateNormal];
+    CGFloat b = 17;
+    _badge.frame = CGRectMake(size-b+2, -4, b, b);
+    _badge.layer.cornerRadius = b/2.0;
+}
+- (void)refreshBadge {
+    if (gMissedCount > 0 && !gHiddenRinging) { _badge.text = (gMissedCount>99)?@"99+":[NSString stringWithFormat:@"%ld",(long)gMissedCount]; _badge.hidden = NO; }
+    else _badge.hidden = YES;
+}
 - (void)restorePosition {
-    CGRect b = UIScreen.mainScreen.bounds; CGFloat size = _button.bounds.size.width;
-    CGFloat x = CHFloat(kCHIconX, b.size.width-size-12), y = CHFloat(kCHIconY, 70);
-    x = MAX(0,MIN(x,b.size.width-size)); y = MAX(0,MIN(y,b.size.height-size));
+    CGRect scr = UIScreen.mainScreen.bounds; CGFloat size = _button.bounds.size.width;
+    CGFloat x = CHFloat(kCHIconX, scr.size.width-size-14), y = CHFloat(kCHIconY, 72);
+    x = MAX(0,MIN(x,scr.size.width-size)); y = MAX(0,MIN(y,scr.size.height-size));
     _button.frame = CGRectMake(x,y,size,size);
 }
 - (void)savePosition {
@@ -196,14 +241,20 @@ static BOOL CHObjHidden(id call) {
     if (g.state == UIGestureRecognizerStateEnded) [self savePosition];
 }
 - (void)tapped {
-    if (!CHTapToAnswer() || !self.call) return;
     @try {
-        if ([self.call respondsToSelector:@selector(callUUID)]) {
-            NSString *u = [self.call callUUID];
-            if (u) { NSMutableSet *s = [gRevealed mutableCopy]; [s addObject:u]; gRevealed = s; }
+        if (gHiddenRinging && CHTapToAnswer() && self.call) {
+            if ([self.call respondsToSelector:@selector(callUUID)]) {
+                NSString *u = [self.call callUUID];
+                if (u) { NSMutableSet *s = [gRevealed mutableCopy]; [s addObject:u]; gRevealed = s; }
+            }
+            id cc = [objc_getClass("TUCallCenter") sharedInstance];
+            if ([cc respondsToSelector:@selector(answerCall:)]) [cc answerCall:self.call];
+            return;
         }
-        id cc = [objc_getClass("TUCallCenter") sharedInstance];
-        if ([cc respondsToSelector:@selector(answerCall:)]) [cc answerCall:self.call];
+        // Otherwise: clear the "you had a hidden call" indicator.
+        gMissedCount = 0; CHPersistMissed();
+        [self refreshBadge]; self.hidden = YES;
+        CHDiag(@"missed indicator cleared by tap");
     } @catch (__unused NSException *e) {}
 }
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
@@ -211,21 +262,20 @@ static BOOL CHObjHidden(id call) {
     return CGRectContainsPoint(_button.frame, point) ? [super hitTest:point withEvent:event] : nil;
 }
 - (void)showForCall:(id)call {
-    self.call = call; CGFloat size = CHFloat(kCHIconSize, 44);
-    [self restorePosition];
-    CGRect f = _button.frame; f.size = CGSizeMake(size,size); _button.frame = f;
-    _button.layer.cornerRadius = size/2.0; self.hidden = NO;
+    self.call = call; [self styleButton]; [self restorePosition]; [self refreshBadge]; self.hidden = NO;
 }
-- (void)hide { self.hidden = YES; self.call = nil; }
 @end
 
-static void CHShowIcon(id call) {
+// Central icon visibility: show while ringing OR while there are unseen misses.
+static void CHUpdateIcon(id ringingCall) {
     if (!gIsSpringBoard) return;
-    dispatch_async(dispatch_get_main_queue(), ^{ @try { [[CHIndicatorWindow shared] showForCall:call]; } @catch(__unused NSException *e){} });
-}
-static void CHHideIcon(void) {
-    if (!gIsSpringBoard) return;
-    dispatch_async(dispatch_get_main_queue(), ^{ @try { [[CHIndicatorWindow shared] hide]; } @catch(__unused NSException *e){} });
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            CHIndicatorWindow *w = [CHIndicatorWindow shared];
+            if (gHiddenRinging || gMissedCount > 0) [w showForCall:ringingCall];
+            else { w.hidden = YES; }
+        } @catch (__unused NSException *e) {}
+    });
 }
 
 #pragma mark - Hooks
@@ -233,21 +283,46 @@ static void CHHideIcon(void) {
 %group SpringBoardGroup
 
 %hook SBInCallPresentationManager
-- (void)inCallPresentationRequestServer:(id)server
-                     clientWithIdentifier:(id)ident
-       requestsPresentationWithConfiguration:(id)config
-                               completion:(void (^)(id))completion {
-    // Observe only this build: confirm this path fires. Do NOT swallow.
-    CHDiag(@"PRES-HOOK fired (hiddenRinging=%d)", gHiddenRinging);
+- (void)inCallPresentationRequestServer:(id)server clientWithIdentifier:(id)ident
+       requestsPresentationWithConfiguration:(id)config completion:(void (^)(id))completion {
+    if (CHSuppressUI() && gHiddenRinging) {
+        CHDiag(@"PRES-HOOK suppressed (hiddenRinging=1)");
+        @try { if (completion) completion(nil); } @catch (__unused NSException *e) {}
+        return;                       // don't present the call UI
+    }
+    CHDiag(@"PRES-HOOK passthrough");
     %orig;
 }
 %end
 
 %hook SBBacklightController
 - (void)turnOnScreenFullyWithBacklightSource:(long long)source {
-    BOOL block = (CHSuppressWake() && gHiddenRinging);
-    CHDiag(@"wake asked src=%lld hiddenRinging=%d block=%d", source, gHiddenRinging, block);
-    if (block) { CHDiag(@"wake blocked"); return; }
+    if (CHSuppressWake() && gHiddenRinging) { CHDiag(@"wake blocked src=%lld", source); return; }
+    %orig;
+}
+%end
+
+%hook BBServer
+- (void)publishBulletinRequest:(BBBulletinRequest *)req destinations:(unsigned long long)dest {
+    @try {
+        if (CHEnabled() && CHHideMissed() && [req isKindOfClass:objc_getClass("BBBulletinRequest")]) {
+            NSString *sec = req.sectionID ?: @"";
+            BOOL callSection = ([sec rangeOfString:@"mobilephone"].location != NSNotFound ||
+                                [sec rangeOfString:@"facetime"].location   != NSNotFound ||
+                                [sec rangeOfString:@"InCall"].location      != NSNotFound);
+            if (callSection) {
+                BOOL hit = NO;
+                BBContact *sender = req.communicationContext.sender;
+                if (sender) {
+                    NSString *cid = [sender respondsToSelector:@selector(cnContactIdentifier)] ? sender.cnContactIdentifier : nil;
+                    NSString *num = [sender respondsToSelector:@selector(handle)] ? CHNormalizeNumber(sender.handle) : nil;
+                    if (CHMatchNumbersOrId(cid, num)) hit = YES;
+                }
+                if (!hit && (CHTextMatchesHidden(req.title) || CHTextMatchesHidden(req.subtitle) || CHTextMatchesHidden(req.message))) hit = YES;
+                if (hit) { CHDiag(@"dropped call bulletin sec=%@ title=%@", sec, req.title ?: @"(nil)"); return; }
+            }
+        }
+    } @catch (__unused NSException *e) { CHDiag(@"EXCEPTION in BBServer hook (caught)"); }
     %orig;
 }
 %end
@@ -256,8 +331,6 @@ static void CHHideIcon(void) {
 
 %hook TUCall
 
-// Forced getter: whenever the system checks, hidden calls report "suppress ring".
-// Safe (returns a BOOL only) — this is the ring-silencing mechanism now.
 - (BOOL)shouldSuppressRingtone {
     @try { if (CHSilenceRinger() && CHObjHidden(self)) return YES; } @catch (__unused NSException *e) {}
     return %orig;
@@ -269,37 +342,26 @@ static void CHHideIcon(void) {
         if (![self respondsToSelector:@selector(isIncoming)] || !self.isIncoming) return;
         BOOL hidden = CHObjHidden(self);
         int st = [self respondsToSelector:@selector(callStatus)] ? self.callStatus : -1;
-        NSString *h = ([self respondsToSelector:@selector(handle)] && [self.handle respondsToSelector:@selector(value)]) ? self.handle.value : @"(nil)";
-        CHDiag(@"status=%d incoming=1 handle=%@ -> hidden=%d", st, h ?: @"(nil)", hidden);
+        NSString *uuid = [self respondsToSelector:@selector(callUUID)] ? self.callUUID : nil;
+        CHDiag(@"status=%d incoming=1 handle=%@ -> hidden=%d", st,
+               ([self.handle respondsToSelector:@selector(value)]?self.handle.value:@"(nil)") ?: @"(nil)", hidden);
+        if (!hidden) return;
 
-        if (hidden) {
-            // status 4 = ringing, 1 = connected/active. Treat "ringing" as active-hidden.
-            BOOL ringing = (st == 4);
-            gHiddenRinging = ringing;
-            CHDiag(@"  set gHiddenRinging=%d", gHiddenRinging);
+        BOOL ringing = (st == 4);
+        gHiddenRinging = ringing;
+        if (CHSilenceRinger() && [self respondsToSelector:@selector(setShouldSuppressRingtone:)]) [(id)self setShouldSuppressRingtone:YES];
+        if (ringing) CHUpdateIcon(self);
 
-            // Silence via property setter only (NO -suppressRingtone action; that crashed).
-            if (CHSilenceRinger() && [self respondsToSelector:@selector(setShouldSuppressRingtone:)]) {
-                CHDiag(@"  pre setShouldSuppressRingtone");
-                [(id)self setShouldSuppressRingtone:YES];
-                CHDiag(@"  post setShouldSuppressRingtone");
-            }
-            CHDiag(@"  pre showIcon");
-            CHShowIcon(self);
-            CHDiag(@"  post showIcon");
-        } else {
-            // Not hidden (or revealed) -> make sure we're not holding the wake block.
-            // (Only clear if this is the call we were tracking state for.)
-        }
-
-        // Call finished? statuses 5/6 = disconnecting/disconnected.
-        if (st == 5 || st == 6) {
+        if (st == 5 || st == 6) {                 // disconnecting / disconnected
             gHiddenRinging = NO;
-            if (hidden) { CHDiag(@"  call ended -> hide icon"); CHHideIcon(); }
+            BOOL answered = (uuid && [gRevealed containsObject:uuid]);
+            if (!answered) {                      // a MISSED hidden call -> persistent indicator
+                gMissedCount++; CHPersistMissed();
+                CHDiag(@"missed hidden call -> count=%ld", (long)gMissedCount);
+            }
+            CHUpdateIcon(nil);
         }
-    } @catch (__unused NSException *e) {
-        CHDiag(@"EXCEPTION in _handleStatusChange (caught)");
-    }
+    } @catch (__unused NSException *e) { CHDiag(@"EXCEPTION in _handleStatusChange (caught)"); }
 }
 
 %end
@@ -312,23 +374,28 @@ static void CHHideIcon(void) {
         gIsSpringBoard = [gProc isEqualToString:@"SpringBoard"];
         gRevealed = [NSSet set];
         CHReload();
-        CHDiag(@"CallHider v1.1.3 loaded in %@ (springboard=%d)", gProc, gIsSpringBoard);
+        CHDiag(@"CallHider v1.2.0 loaded in %@ (springboard=%d, missed=%ld)", gProc, gIsSpringBoard, (long)gMissedCount);
 
         %init(_ungrouped);
         if (gIsSpringBoard) %init(SpringBoardGroup);
 
-        int t1; notify_register_dispatch(kCHReloadNotify, &t1, dispatch_get_main_queue(), ^(int t){ CHReload(); });
+        int t1; notify_register_dispatch(kCHReloadNotify, &t1, dispatch_get_main_queue(), ^(int t){ CHReload(); CHUpdateIcon(nil); });
         if (gIsSpringBoard) {
+            // restore persistent indicator after SpringBoard launch
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(3*NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ CHUpdateIcon(nil); });
+
             int t2; notify_register_dispatch(kCHTestIconNotify, &t2, dispatch_get_main_queue(), ^(int t){
                 CHDiag(@"test icon requested");
                 [[CHIndicatorWindow shared] showForCall:nil];
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(5*NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                    if (!gHiddenRinging) [[CHIndicatorWindow shared] hide];
+                    if (!gHiddenRinging && gMissedCount == 0) [CHIndicatorWindow shared].hidden = YES;
                 });
             });
             int t3; notify_register_dispatch(kCHClearLogNotify, &t3, dispatch_get_main_queue(), ^(int t){
-                [[NSFileManager defaultManager] removeItemAtPath:kCHDiagPath error:nil];
-                CHDiag(@"log cleared");
+                [[NSFileManager defaultManager] removeItemAtPath:kCHDiagPath error:nil]; CHDiag(@"log cleared");
+            });
+            int t4; notify_register_dispatch(kCHClearMissedNotify, &t4, dispatch_get_main_queue(), ^(int t){
+                gMissedCount = 0; CHPersistMissed(); CHDiag(@"missed indicator cleared from settings"); CHUpdateIcon(nil);
             });
         }
     }
