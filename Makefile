@@ -9,7 +9,7 @@ include $(THEOS)/makefiles/common.mk
 TWEAK_NAME = CallHider
 CallHider_FILES = Tweak.xm
 CallHider_CFLAGS = -fobjc-arc
-CallHider_FRAMEWORKS = UIKit Foundation
+CallHider_FRAMEWORKS = UIKit Foundation AudioToolbox
 
 include $(THEOS)/makefiles/tweak.mk
 

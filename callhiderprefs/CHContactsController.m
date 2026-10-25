@@ -40,6 +40,15 @@
     self.navigationItem.rightBarButtonItem =
         [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemAdd
                                                       target:self action:@selector(addTapped)];
+    // Edit toggles delete controls on each row; tapping Done saves the result.
+    self.navigationItem.leftBarButtonItem = self.editButtonItem;
+}
+
+// editButtonItem calls this; drive the table's editing mode so per-row delete
+// controls (the red minus) appear, letting individual contacts be removed.
+- (void)setEditing:(BOOL)editing animated:(BOOL)animated {
+    [super setEditing:editing animated:animated];
+    [_table setEditing:editing animated:animated];
 }
 
 - (void)viewWillAppear:(BOOL)animated {

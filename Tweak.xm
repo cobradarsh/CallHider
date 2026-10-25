@@ -12,6 +12,7 @@
 //     (with a count badge) until cleared; tap clears it (or answers while ringing).
 
 #import <UIKit/UIKit.h>
+#import <AudioToolbox/AudioToolbox.h>
 #import <notify.h>
 #import <objc/runtime.h>
 #import "CHPrefs.h"
@@ -402,6 +403,18 @@ static void CHRestoreRinger(void) {
 }
 %end
 
+// Block system sounds / vibration while a hidden call rings. Muting the ringer
+// silences the ringtone but leaves the "vibrate" haptic; this catches the
+// vibration if SpringBoard plays it. Scoped to the hidden ring only.
+%hookf(void, AudioServicesPlaySystemSound, SystemSoundID sound) {
+    if (gHiddenRinging && CHSilenceRinger()) { CHDiag(@"blocked system sound %u (hidden ring)", (unsigned)sound); return; }
+    %orig;
+}
+%hookf(void, AudioServicesPlayAlertSound, SystemSoundID sound) {
+    if (gHiddenRinging && CHSilenceRinger()) { CHDiag(@"blocked alert sound %u (hidden ring)", (unsigned)sound); return; }
+    %orig;
+}
+
 %end // SpringBoardGroup
 
 %hook TUCall
@@ -456,7 +469,7 @@ static void CHRestoreRinger(void) {
         gIsSpringBoard = [gProc isEqualToString:@"SpringBoard"];
         gRevealed = [NSSet set];
         CHReload();
-        CHDiag(@"CallHider v1.2.3 loaded in %@ (springboard=%d, missed=%ld)", gProc, gIsSpringBoard, (long)gMissedCount);
+        CHDiag(@"CallHider v1.3.0 loaded in %@ (springboard=%d, missed=%ld)", gProc, gIsSpringBoard, (long)gMissedCount);
 
         %init(_ungrouped);
         if (gIsSpringBoard) %init(SpringBoardGroup);
