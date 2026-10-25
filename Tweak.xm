@@ -40,6 +40,10 @@
 @interface SpringBoard : UIApplication
 - (void)_updateRingerState:(int)arg1 withVisuals:(BOOL)arg2 updatePreferenceRegister:(BOOL)arg3;
 @end
+// The incoming-call banner; on Dynamic Island devices this is what renders the
+// call pill. We can't stop its creation, but we can keep its view off screen.
+@interface SBInCallBannerPresentableViewController : UIViewController
+@end
 
 // BulletinBoard (for dropping the missed-call notification)
 @interface BBContact : NSObject
@@ -376,6 +380,25 @@ static void CHRestoreRinger(void) {
 }
 %end
 
+%hook SBInCallBannerPresentableViewController
+// The Dynamic Island call pill: PRES-HOOK doesn't stop it, so keep this banner's
+// view off screen while a hidden call is ringing. %orig runs first (safe), then
+// we hide; re-applied on layout in case the system un-hides it.
+- (void)viewDidAppear:(BOOL)animated {
+    %orig;
+    @try {
+        if (CHSuppressUI() && gHiddenRinging) {
+            CHDiag(@"hiding in-call banner VC (Dynamic Island) for hidden call");
+            self.view.hidden = YES; self.view.alpha = 0.0;
+        }
+    } @catch (__unused NSException *e) {}
+}
+- (void)viewWillLayoutSubviews {
+    %orig;
+    @try { if (CHSuppressUI() && gHiddenRinging) { self.view.hidden = YES; self.view.alpha = 0.0; } } @catch (__unused NSException *e) {}
+}
+%end
+
 %end // SpringBoardGroup
 
 %hook TUCall
@@ -430,7 +453,7 @@ static void CHRestoreRinger(void) {
         gIsSpringBoard = [gProc isEqualToString:@"SpringBoard"];
         gRevealed = [NSSet set];
         CHReload();
-        CHDiag(@"CallHider v1.2.1 loaded in %@ (springboard=%d, missed=%ld)", gProc, gIsSpringBoard, (long)gMissedCount);
+        CHDiag(@"CallHider v1.2.2 loaded in %@ (springboard=%d, missed=%ld)", gProc, gIsSpringBoard, (long)gMissedCount);
 
         %init(_ungrouped);
         if (gIsSpringBoard) %init(SpringBoardGroup);
