@@ -74,6 +74,9 @@ static BOOL gSystemRingerOn = YES;        // last ringer state the SYSTEM set
 static BOOL gWeMutedRinger = NO;          // we lowered the ringer for a hidden call
 static BOOL gInOurRinger = NO;            // guard so our own calls don't self-record
 
+static void CHMuteRinger(void);           // defined below; used from the icon tap handler
+static void CHRestoreRinger(void);
+
 #pragma mark - Diagnostics
 
 static void CHDiag(NSString *fmt, ...) {
@@ -453,7 +456,7 @@ static void CHRestoreRinger(void) {
         gIsSpringBoard = [gProc isEqualToString:@"SpringBoard"];
         gRevealed = [NSSet set];
         CHReload();
-        CHDiag(@"CallHider v1.2.2 loaded in %@ (springboard=%d, missed=%ld)", gProc, gIsSpringBoard, (long)gMissedCount);
+        CHDiag(@"CallHider v1.2.3 loaded in %@ (springboard=%d, missed=%ld)", gProc, gIsSpringBoard, (long)gMissedCount);
 
         %init(_ungrouped);
         if (gIsSpringBoard) %init(SpringBoardGroup);
