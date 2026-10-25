@@ -37,6 +37,9 @@
 @interface SBBacklightController : NSObject
 - (void)turnOnScreenFullyWithBacklightSource:(long long)source;
 @end
+@interface SpringBoard : UIApplication
+- (void)_updateRingerState:(int)arg1 withVisuals:(BOOL)arg2 updatePreferenceRegister:(BOOL)arg3;
+@end
 
 // BulletinBoard (for dropping the missed-call notification)
 @interface BBContact : NSObject
@@ -63,6 +66,9 @@ static NSDictionary *gPrefs = nil;
 static NSSet<NSString *> *gRevealed;
 static volatile BOOL gHiddenRinging = NO;
 static NSInteger gMissedCount = 0;        // persistent "you had a hidden call" count
+static BOOL gSystemRingerOn = YES;        // last ringer state the SYSTEM set
+static BOOL gWeMutedRinger = NO;          // we lowered the ringer for a hidden call
+static BOOL gInOurRinger = NO;            // guard so our own calls don't self-record
 
 #pragma mark - Diagnostics
 
@@ -249,6 +255,7 @@ static BOOL CHTextMatchesHidden(NSString *text) {
             }
             id cc = [objc_getClass("TUCallCenter") sharedInstance];
             if ([cc respondsToSelector:@selector(answerCall:)]) [cc answerCall:self.call];
+            gHiddenRinging = NO; CHRestoreRinger();   // bring the ringer back now
             return;
         }
         // Otherwise: clear the "you had a hidden call" indicator.
@@ -275,6 +282,39 @@ static void CHUpdateIcon(id ringingCall) {
             if (gHiddenRinging || gMissedCount > 0) [w showForCall:ringingCall];
             else { w.hidden = YES; }
         } @catch (__unused NSException *e) {}
+    });
+}
+
+// The call ringtone (and vibration) is produced by the ringtone SERVER, where
+// our shouldSuppressRingtone hook has no effect — so for a hidden call we
+// temporarily drop the system ringer (proven CallKiller technique) and restore
+// it when the call ends. We only touch it if the ringer was actually on, so we
+// never un-silence a phone that was already silent.
+static void CHMuteRinger(void) {
+    if (!gIsSpringBoard || gWeMutedRinger || !gSystemRingerOn) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            SpringBoard *sb = (SpringBoard *)[UIApplication sharedApplication];
+            if (![sb respondsToSelector:@selector(_updateRingerState:withVisuals:updatePreferenceRegister:)]) return;
+            gInOurRinger = YES;
+            [sb _updateRingerState:0 withVisuals:NO updatePreferenceRegister:NO];
+            gInOurRinger = NO;
+            gWeMutedRinger = YES;
+            CHDiag(@"ringer muted for hidden call");
+        } @catch (__unused NSException *e) { gInOurRinger = NO; }
+    });
+}
+static void CHRestoreRinger(void) {
+    if (!gIsSpringBoard || !gWeMutedRinger) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            SpringBoard *sb = (SpringBoard *)[UIApplication sharedApplication];
+            gInOurRinger = YES;
+            [sb _updateRingerState:1 withVisuals:NO updatePreferenceRegister:NO];
+            gInOurRinger = NO;
+            gWeMutedRinger = NO;
+            CHDiag(@"ringer restored");
+        } @catch (__unused NSException *e) { gInOurRinger = NO; }
     });
 }
 
@@ -327,6 +367,15 @@ static void CHUpdateIcon(id ringingCall) {
 }
 %end
 
+%hook SpringBoard
+// Track the ringer state the system sets, so CHMuteRinger only acts when the
+// ringer was actually on (and knows what to restore to).
+- (void)_updateRingerState:(int)state withVisuals:(BOOL)v updatePreferenceRegister:(BOOL)p {
+    if (!gInOurRinger) gSystemRingerOn = (state != 0);
+    %orig;
+}
+%end
+
 %end // SpringBoardGroup
 
 %hook TUCall
@@ -350,10 +399,17 @@ static void CHUpdateIcon(id ringingCall) {
         BOOL ringing = (st == 4);
         gHiddenRinging = ringing;
         if (CHSilenceRinger() && [self respondsToSelector:@selector(setShouldSuppressRingtone:)]) [(id)self setShouldSuppressRingtone:YES];
-        if (ringing) CHUpdateIcon(self);
+        if (ringing) {
+            if (CHSilenceRinger()) CHMuteRinger();     // kills ringtone + ring-mode vibration
+            CHUpdateIcon(self);
+            // safety net: never leave the ringer muted beyond a normal ring
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(60 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{ if (!gHiddenRinging) CHRestoreRinger(); });
+        }
 
         if (st == 5 || st == 6) {                 // disconnecting / disconnected
             gHiddenRinging = NO;
+            CHRestoreRinger();
             BOOL answered = (uuid && [gRevealed containsObject:uuid]);
             if (!answered) {                      // a MISSED hidden call -> persistent indicator
                 gMissedCount++; CHPersistMissed();
@@ -374,7 +430,7 @@ static void CHUpdateIcon(id ringingCall) {
         gIsSpringBoard = [gProc isEqualToString:@"SpringBoard"];
         gRevealed = [NSSet set];
         CHReload();
-        CHDiag(@"CallHider v1.2.0 loaded in %@ (springboard=%d, missed=%ld)", gProc, gIsSpringBoard, (long)gMissedCount);
+        CHDiag(@"CallHider v1.2.1 loaded in %@ (springboard=%d, missed=%ld)", gProc, gIsSpringBoard, (long)gMissedCount);
 
         %init(_ungrouped);
         if (gIsSpringBoard) %init(SpringBoardGroup);
