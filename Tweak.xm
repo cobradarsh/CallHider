@@ -32,10 +32,19 @@
 @property (nonatomic, readonly, copy) NSString *callUUID;
 - (void)setShouldSuppressRingtone:(BOOL)v;
 - (void)setRingtoneSuppressedRemotely:(BOOL)v;   // Continuity "silenced from another device"; reaches the ringtone server
+- (void)disconnectWithReason:(int)reason;
 @end
 @interface TUCallCenter : NSObject
 + (instancetype)sharedInstance;
 - (void)answerCall:(TUCall *)call;
+- (void)disconnectCall:(TUCall *)call;
+- (void)disconnectAllCalls;
+@end
+
+// SpringBoard's in-call presentation session: on Dynamic Island devices it
+// creates the call pill (internally a "Jindo" SBSystemApertureSceneElement).
+// Suppressing that creation is what keeps a hidden call out of the Island.
+@interface SBInCallPresentationSession : NSObject
 @end
 @interface SBBacklightController : NSObject
 - (void)turnOnScreenFullyWithBacklightSource:(long long)source;
@@ -122,7 +131,10 @@ static NSString *gProc = nil;
 static NSDictionary *gPrefs = nil;
 static NSSet<NSString *> *gRevealed;
 static NSString *gLoggedUUID = nil;       // last hidden call written to the log (once per call)
-static volatile BOOL gHiddenRinging = NO;
+static volatile BOOL gHiddenRinging = NO;    // a hidden call is RINGING (ringer/vibration/wake scope)
+static volatile BOOL gHiddenCallActive = NO; // a hidden call exists: ringing OR answered, until it ends (UI scope)
+static id gHiddenCall = nil;                 // the live hidden TUCall, for answer/hang-up from the icon
+static NSString *gHiddenCallUUID = nil;      // its UUID, so we still clean up after it is answered (revealed)
 static NSInteger gMissedCount = 0;        // persistent "you had a hidden call" count
 static BOOL gSystemRingerOn = YES;        // last ringer state the SYSTEM set
 static BOOL gWeMutedRinger = NO;          // we lowered the ringer for a hidden call
@@ -281,6 +293,7 @@ static BOOL CHTextMatchesHidden(NSString *text) {
 @property (nonatomic, strong) UIButton *button;
 @property (nonatomic, strong) UILabel *badge;
 @property (nonatomic, weak)   id call;
+@property (nonatomic, assign) BOOL connected;   // NO = red (ringing, tap answers); YES = green (tap hangs up)
 @end
 
 @implementation CHIndicatorWindow
@@ -325,15 +338,19 @@ static BOOL CHTextMatchesHidden(NSString *text) {
     _button.layer.cornerRadius = size/2.0;
     _button.layer.shadowColor = UIColor.blackColor.CGColor; _button.layer.shadowOpacity = 0.35;
     _button.layer.shadowRadius = 3; _button.layer.shadowOffset = CGSizeMake(0,1);
-    _button.tintColor = [UIColor colorWithRed:0.86 green:0.15 blue:0.15 alpha:1.0]; // red phone glyph
+    // Connected (answered) -> green hang-up glyph; otherwise red phone glyph.
+    _button.tintColor = _connected ? [UIColor colorWithRed:0.18 green:0.69 blue:0.28 alpha:1.0]
+                                   : [UIColor colorWithRed:0.86 green:0.15 blue:0.15 alpha:1.0];
     UIImageConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:size*0.52 weight:UIImageSymbolWeightSemibold];
-    [_button setImage:[UIImage systemImageNamed:@"phone.fill" withConfiguration:cfg] forState:UIControlStateNormal];
+    NSString *glyph = _connected ? @"phone.down.fill" : @"phone.fill";
+    [_button setImage:[UIImage systemImageNamed:glyph withConfiguration:cfg] forState:UIControlStateNormal];
     CGFloat b = 17;
     _badge.frame = CGRectMake(size-b+2, -4, b, b);
     _badge.layer.cornerRadius = b/2.0;
 }
 - (void)refreshBadge {
-    if (gMissedCount > 0 && !gHiddenRinging) { _badge.text = (gMissedCount>99)?@"99+":[NSString stringWithFormat:@"%ld",(long)gMissedCount]; _badge.hidden = NO; }
+    // The count badge is for unseen misses only — hide it during a live hidden call.
+    if (gMissedCount > 0 && !gHiddenCallActive) { _badge.text = (gMissedCount>99)?@"99+":[NSString stringWithFormat:@"%ld",(long)gMissedCount]; _badge.hidden = NO; }
     else _badge.hidden = YES;
 }
 - (void)restorePosition {
@@ -356,17 +373,35 @@ static BOOL CHTextMatchesHidden(NSString *text) {
 }
 - (void)tapped {
     @try {
-        if (gHiddenRinging && CHTapToAnswer() && self.call) {
-            if ([self.call respondsToSelector:@selector(callUUID)]) {
-                NSString *u = [self.call callUUID];
+        id call = self.call ?: gHiddenCall;
+        // 1) GREEN (answered): tap hangs up the call.
+        if (_connected) {
+            CHDiag(@"green icon tapped -> hang up hidden call");
+            @try {
+                id cc = [objc_getClass("TUCallCenter") sharedInstance];
+                if (call && [cc respondsToSelector:@selector(disconnectCall:)]) [cc disconnectCall:call];
+                else if (call && [call respondsToSelector:@selector(disconnectWithReason:)]) [call disconnectWithReason:0];
+                else if ([cc respondsToSelector:@selector(disconnectAllCalls)]) [(id)cc disconnectAllCalls];
+            } @catch (__unused NSException *e) {}
+            _connected = NO;                 // the status-change hook will do final cleanup
+            [self refreshBadge]; self.hidden = YES;
+            return;
+        }
+        // 2) RED while ringing + tap-to-answer on: answer, then turn green (stay on screen).
+        if (gHiddenRinging && CHTapToAnswer() && call) {
+            if ([call respondsToSelector:@selector(callUUID)]) {
+                NSString *u = [call callUUID];
                 if (u) { NSMutableSet *s = [gRevealed mutableCopy]; [s addObject:u]; gRevealed = s; }
             }
             id cc = [objc_getClass("TUCallCenter") sharedInstance];
-            if ([cc respondsToSelector:@selector(answerCall:)]) [cc answerCall:self.call];
-            gHiddenRinging = NO; CHRestoreRinger(); CHRestoreDisplay();   // bring ringer + display back now
+            if ([cc respondsToSelector:@selector(answerCall:)]) [cc answerCall:call];
+            gHiddenRinging = NO; CHRestoreRinger(); CHRestoreDisplay();   // stop ringer suppression; call stays hidden
+            _connected = YES;                // green hang-up glyph; call remains active + UI hidden
+            [self styleButton];
+            CHDiag(@"red icon answered hidden call -> green (tap to hang up)");
             return;
         }
-        // Otherwise: clear the "you had a hidden call" indicator.
+        // 3) Otherwise: clear the "you had a hidden call" indicator.
         gMissedCount = 0; CHPersistMissed();
         [self refreshBadge]; self.hidden = YES;
         CHDiag(@"missed indicator cleared by tap");
@@ -377,18 +412,22 @@ static BOOL CHTextMatchesHidden(NSString *text) {
     return CGRectContainsPoint(_button.frame, point) ? [super hitTest:point withEvent:event] : nil;
 }
 - (void)showForCall:(id)call {
-    self.call = call; [self styleButton]; [self restorePosition]; [self refreshBadge]; self.hidden = NO;
+    if (call) self.call = call; [self styleButton]; [self restorePosition]; [self refreshBadge]; self.hidden = NO;
 }
 @end
 
-// Central icon visibility: show while ringing OR while there are unseen misses.
-static void CHUpdateIcon(id ringingCall) {
+// Central icon visibility: show during a live hidden call (red while ringing,
+// green once answered) OR while there are unseen misses.
+static void CHUpdateIcon(id activeCall) {
     if (!gIsSpringBoard) return;
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
             CHIndicatorWindow *w = [CHIndicatorWindow shared];
-            if (gHiddenRinging || gMissedCount > 0) [w showForCall:ringingCall];
-            else { w.hidden = YES; }
+            if (gHiddenCallActive || gHiddenRinging || gMissedCount > 0) {
+                // Green only during an answered call; ringing and missed show red.
+                if (gHiddenRinging || !gHiddenCallActive) w.connected = NO;
+                [w showForCall:activeCall];
+            } else { w.connected = NO; w.hidden = YES; }
         } @catch (__unused NSException *e) {}
     });
 }
@@ -558,8 +597,8 @@ static void CHPurgeFromRecents(NSString *number) {
 %hook SBInCallPresentationManager
 - (void)inCallPresentationRequestServer:(id)server clientWithIdentifier:(id)ident
        requestsPresentationWithConfiguration:(id)config completion:(void (^)(id))completion {
-    if (CHSuppressUI() && gHiddenRinging) {
-        CHDiag(@"PRES-HOOK suppressed (hiddenRinging=1)");
+    if (CHSuppressUI() && gHiddenCallActive) {
+        CHDiag(@"PRES-HOOK suppressed (hidden call active)");
         @try { if (completion) completion(nil); } @catch (__unused NSException *e) {}
         return;                       // don't present the call UI
     }
@@ -610,21 +649,41 @@ static void CHPurgeFromRecents(NSString *number) {
 %end
 
 %hook SBInCallBannerPresentableViewController
-// The Dynamic Island call pill: PRES-HOOK doesn't stop it, so keep this banner's
-// view off screen while a hidden call is ringing. %orig runs first (safe), then
-// we hide; re-applied on layout in case the system un-hides it.
+// The banner/pill view: keep it off screen for the whole hidden call (ringing
+// and, if answered, connected). %orig runs first (safe), then we hide; re-applied
+// on layout in case the system un-hides it.
 - (void)viewDidAppear:(BOOL)animated {
     %orig;
     @try {
-        if (CHSuppressUI() && gHiddenRinging) {
-            CHDiag(@"hiding in-call banner VC (Dynamic Island) for hidden call");
+        if (CHSuppressUI() && gHiddenCallActive) {
+            CHDiag(@"hiding in-call banner VC for hidden call");
             self.view.hidden = YES; self.view.alpha = 0.0;
         }
     } @catch (__unused NSException *e) {}
 }
 - (void)viewWillLayoutSubviews {
     %orig;
-    @try { if (CHSuppressUI() && gHiddenRinging) { self.view.hidden = YES; self.view.alpha = 0.0; } } @catch (__unused NSException *e) {}
+    @try { if (CHSuppressUI() && gHiddenCallActive) { self.view.hidden = YES; self.view.alpha = 0.0; } } @catch (__unused NSException *e) {}
+}
+%end
+
+// The Dynamic Island pill is a separate "Jindo" scene element the in-call
+// session creates — the banner hook above never touches it. Skip its creation
+// entirely while a hidden call is active, so nothing appears in the Island.
+// If these private selectors differ on this iOS, the hooks simply never install
+// (the diagnostics below say which one fired).
+%hook SBInCallPresentationSession
+- (void)_createJindoElementIfNeeded {
+    if (CHSuppressUI() && gHiddenCallActive) { CHDiag(@"Island: blocked Jindo element creation (hidden call)"); return; }
+    %orig;
+}
+- (void)_createJindoElement {
+    if (CHSuppressUI() && gHiddenCallActive) { CHDiag(@"Island: blocked Jindo element (direct, hidden call)"); return; }
+    %orig;
+}
+- (void)_activeJindoElementIfNeeded {
+    if (CHSuppressUI() && gHiddenCallActive) { CHDiag(@"Island: blocked Jindo activation (hidden call)"); return; }
+    %orig;
 }
 %end
 
@@ -680,12 +739,15 @@ static void CHPurgeFromRecents(NSString *number) {
 }
 
 - (void)_handleStatusChange {
-    // Raise the flag BEFORE the system reacts to the change, so the first
-    // "should we vibrate?" question for a hidden ring already gets NO.
+    // Raise the flags BEFORE the system reacts to the change, so the first
+    // "should we vibrate?" question — and the Island element creation — for a
+    // hidden ring already see an active hidden call.
     @try {
         if ([self respondsToSelector:@selector(isIncoming)] && self.isIncoming &&
-            [self respondsToSelector:@selector(callStatus)] && self.callStatus == 4 && CHObjHidden(self))
-            gHiddenRinging = YES;
+            [self respondsToSelector:@selector(callStatus)] && self.callStatus == 4 && CHObjHidden(self)) {
+            gHiddenRinging = YES; gHiddenCallActive = YES; gHiddenCall = self;
+            if ([self respondsToSelector:@selector(callUUID)]) gHiddenCallUUID = [self callUUID];
+        }
     } @catch (__unused NSException *e) {}
     %orig;
     @try {
@@ -693,14 +755,18 @@ static void CHPurgeFromRecents(NSString *number) {
         BOOL hidden = CHObjHidden(self);
         int st = [self respondsToSelector:@selector(callStatus)] ? self.callStatus : -1;
         NSString *uuid = [self respondsToSelector:@selector(callUUID)] ? self.callUUID : nil;
-        CHDiag(@"status=%d incoming=1 handle=%@ -> hidden=%d", st,
-               ([self.handle respondsToSelector:@selector(value)]?self.handle.value:@"(nil)") ?: @"(nil)", hidden);
+        // A call we flagged stays "tracked" even after it is answered (and thus
+        // revealed / no longer "hidden"), so its disconnect still cleans up.
+        BOOL tracked = (uuid && gHiddenCallUUID && [uuid isEqualToString:gHiddenCallUUID]);
+        CHDiag(@"status=%d incoming=1 handle=%@ -> hidden=%d tracked=%d", st,
+               ([self.handle respondsToSelector:@selector(value)]?self.handle.value:@"(nil)") ?: @"(nil)", hidden, tracked);
         if (!gIsSpringBoard) {                    // tell SpringBoard what this process saw
             gReport = (gReport & ~(3ULL << 24)) | (hidden ? (1ULL << 24) : 0);
             CHReportPublish();
         }
-        if (!hidden) return;
+        if (!hidden && !tracked) return;
 
+        if (hidden && gIsSpringBoard) { gHiddenCallActive = YES; gHiddenCall = self; gHiddenCallUUID = uuid; }
         BOOL ringing = (st == 4);
         gHiddenRinging = ringing;
         if (CHSilenceRinger()) {
@@ -729,6 +795,8 @@ static void CHPurgeFromRecents(NSString *number) {
 
         if (st == 5 || st == 6) {                 // disconnecting / disconnected
             gHiddenRinging = NO;
+            gHiddenCallActive = NO;               // hidden call is over: let the Island/UI behave normally again
+            gHiddenCall = nil; gHiddenCallUUID = nil;
             CHRestoreRinger();
             CHRestoreDisplay();
             CHNudgeVibrationManagers();           // vibration decisions back to the user's settings
@@ -789,7 +857,7 @@ static void CHPurgeFromRecents(NSString *number) {
         gRevealed = [NSSet set];
         CHReload();
         if (!gIsSpringBoard) { gReport |= 1ULL; CHReportPublish(); }   // "loaded" bit for the report
-        CHDiag(@"CallHider v1.6.2 loaded in %@ (springboard=%d, missed=%ld)", gProc, gIsSpringBoard, (long)gMissedCount);
+        CHDiag(@"CallHider v1.7.0 loaded in %@ (springboard=%d, missed=%ld)", gProc, gIsSpringBoard, (long)gMissedCount);
 
         %init(_ungrouped);
         if (gIsSpringBoard) %init(SpringBoardGroup);
