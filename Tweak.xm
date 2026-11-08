@@ -42,6 +42,27 @@
 @interface SpringBoard : UIApplication
 - (void)_updateRingerState:(int)arg1 withVisuals:(BOOL)arg2 updatePreferenceRegister:(BOOL)arg3;
 @end
+
+// BacklightServices: the system's own way to disable Always-On (used face-down,
+// in Sleep Focus, etc.). Holding an assertion with this attribute drops the
+// display to fully black; invalidating it restores AOD.
+@interface BLSAttribute : NSObject @end
+@interface BLSDisableAlwaysOnAttribute : BLSAttribute
++ (id)disableAlwaysOn;
+@end
+@interface BLSAssertion : NSObject
++ (id)acquireWithExplanation:(NSString *)explanation observer:(id)observer attributes:(NSArray *)attributes;
+- (void)invalidate;
+- (BOOL)isAcquired;
+@end
+@interface SBLockScreenManager : NSObject
++ (instancetype)sharedInstance;
+- (BOOL)isUILocked;
+@end
+
+// Private AudioToolbox export used for patterned (call) vibration — the API my
+// earlier PlaySystemSound/PlayAlertSound hooks did not cover.
+extern void AudioServicesPlaySystemSoundWithVibration(SystemSoundID inSystemSoundID, id arg, NSDictionary *vibratePattern);
 // The incoming-call banner; on Dynamic Island devices this is what renders the
 // call pill. We can't stop its creation, but we can keep its view off screen.
 @interface SBInCallBannerPresentableViewController : UIViewController
@@ -93,6 +114,13 @@ static BOOL gInOurRinger = NO;            // guard so our own calls don't self-r
 
 static void CHMuteRinger(void);           // defined below; used from the icon tap handler
 static void CHRestoreRinger(void);
+static void CHRestoreDisplay(void);
+
+// Vibrate settings we temporarily disable during a hidden ring (restored after).
+static id   gOrigRingVibrate = nil, gOrigSilentVibrate = nil;
+static BOOL gVibrateToggled = NO;
+// Always-On-Display disable assertion held while a hidden call rings (locked only).
+static id   gAODAssertion = nil;
 
 #pragma mark - Diagnostics
 
@@ -320,7 +348,7 @@ static BOOL CHTextMatchesHidden(NSString *text) {
             }
             id cc = [objc_getClass("TUCallCenter") sharedInstance];
             if ([cc respondsToSelector:@selector(answerCall:)]) [cc answerCall:self.call];
-            gHiddenRinging = NO; CHRestoreRinger();   // bring the ringer back now
+            gHiddenRinging = NO; CHRestoreRinger(); CHRestoreDisplay();   // bring ringer + display back now
             return;
         }
         // Otherwise: clear the "you had a hidden call" indicator.
@@ -355,12 +383,27 @@ static void CHUpdateIcon(id ringingCall) {
 // temporarily drop the system ringer (proven CallKiller technique) and restore
 // it when the call ends. We only touch it if the ringer was actually on, so we
 // never un-silence a phone that was already silent.
+#define kSBPrefs CFSTR("com.apple.springboard")
+
 static void CHMuteRinger(void) {
     // Always mute (the old "only if the ringer was observed on" gate skipped
     // itself after resprings); restore goes back to the last observed state.
     if (!gIsSpringBoard || gWeMutedRinger) return;
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
+            // Silent mode still vibrates if "Play Haptics in Silent Mode" is on,
+            // so disable both vibrate settings for the duration of the mute.
+            // Set BEFORE the ringer transition so the alert re-evaluates against them.
+            if (!gVibrateToggled) {
+                gOrigRingVibrate   = CFBridgingRelease(CFPreferencesCopyAppValue(CFSTR("ring-vibrate"),   kSBPrefs));
+                gOrigSilentVibrate = CFBridgingRelease(CFPreferencesCopyAppValue(CFSTR("silent-vibrate"), kSBPrefs));
+                CFPreferencesSetAppValue(CFSTR("ring-vibrate"),   kCFBooleanFalse, kSBPrefs);
+                CFPreferencesSetAppValue(CFSTR("silent-vibrate"), kCFBooleanFalse, kSBPrefs);
+                CFPreferencesAppSynchronize(kSBPrefs);
+                gVibrateToggled = YES;
+                CHDiag(@"vibrate settings disabled (ring was %@, silent was %@)",
+                       gOrigRingVibrate ?: @"default", gOrigSilentVibrate ?: @"default");
+            }
             SpringBoard *sb = (SpringBoard *)[UIApplication sharedApplication];
             if (![sb respondsToSelector:@selector(_updateRingerState:withVisuals:updatePreferenceRegister:)]) return;
             gInOurRinger = YES;
@@ -372,16 +415,66 @@ static void CHMuteRinger(void) {
     });
 }
 static void CHRestoreRinger(void) {
-    if (!gIsSpringBoard || !gWeMutedRinger) return;
+    if (!gIsSpringBoard || (!gWeMutedRinger && !gVibrateToggled)) return;
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
-            SpringBoard *sb = (SpringBoard *)[UIApplication sharedApplication];
-            gInOurRinger = YES;
-            [sb _updateRingerState:(gSystemRingerOn ? 1 : 0) withVisuals:NO updatePreferenceRegister:NO];
-            gInOurRinger = NO;
-            gWeMutedRinger = NO;
-            CHDiag(@"ringer restored");
+            if (gWeMutedRinger) {
+                SpringBoard *sb = (SpringBoard *)[UIApplication sharedApplication];
+                gInOurRinger = YES;
+                [sb _updateRingerState:(gSystemRingerOn ? 1 : 0) withVisuals:NO updatePreferenceRegister:NO];
+                gInOurRinger = NO;
+                gWeMutedRinger = NO;
+                CHDiag(@"ringer restored");
+            }
+            if (gVibrateToggled) {                    // nil original -> key removed -> back to default
+                CFPreferencesSetAppValue(CFSTR("ring-vibrate"),   (__bridge CFPropertyListRef)gOrigRingVibrate,   kSBPrefs);
+                CFPreferencesSetAppValue(CFSTR("silent-vibrate"), (__bridge CFPropertyListRef)gOrigSilentVibrate, kSBPrefs);
+                CFPreferencesAppSynchronize(kSBPrefs);
+                gVibrateToggled = NO; gOrigRingVibrate = nil; gOrigSilentVibrate = nil;
+                CHDiag(@"vibrate settings restored");
+            }
         } @catch (__unused NSException *e) { gInOurRinger = NO; }
+    });
+}
+
+#pragma mark - Always-On Display
+
+static BOOL CHLocked(void) {
+    @try {
+        Class c = objc_getClass("SBLockScreenManager");
+        id m = [c respondsToSelector:@selector(sharedInstance)] ? [c sharedInstance] : nil;
+        return [m respondsToSelector:@selector(isUILocked)] ? [m isUILocked] : NO;
+    } @catch (__unused NSException *e) { return NO; }
+}
+
+// While a hidden call rings and the phone is LOCKED, hold the system's
+// "disable Always-On" assertion so the display goes fully black (no AOD).
+// Never touches the display while you're actively using the phone.
+static void CHForceDisplayOff(void) {
+    if (!gIsSpringBoard || !CHSuppressWake() || gAODAssertion) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            if (!CHLocked()) { CHDiag(@"AOD: phone unlocked/in use; not blanking display"); return; }
+            Class A = objc_getClass("BLSAssertion"), D = objc_getClass("BLSDisableAlwaysOnAttribute");
+            if (!A || !D || ![D respondsToSelector:@selector(disableAlwaysOn)] ||
+                ![A respondsToSelector:@selector(acquireWithExplanation:observer:attributes:)]) {
+                CHDiag(@"AOD: BLS disable-always-on API unavailable"); return;
+            }
+            id attr = [D disableAlwaysOn];
+            if (!attr) { CHDiag(@"AOD: no attribute"); return; }
+            gAODAssertion = [A acquireWithExplanation:@"CallHider: hidden call" observer:nil attributes:@[attr]];
+            CHDiag(@"AOD disable assertion %@", gAODAssertion ? @"acquired (display -> off)" : @"FAILED");
+        } @catch (__unused NSException *e) { CHDiag(@"EXCEPTION forcing display off (caught)"); }
+    });
+}
+static void CHRestoreDisplay(void) {
+    if (!gIsSpringBoard || !gAODAssertion) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            id a = gAODAssertion; gAODAssertion = nil;
+            if ([a respondsToSelector:@selector(invalidate)]) [a invalidate];
+            CHDiag(@"AOD disable assertion released");
+        } @catch (__unused NSException *e) {}
     });
 }
 
@@ -530,6 +623,11 @@ static void CHPurgeFromRecents(NSString *number) {
     if (gHiddenRinging && CHSilenceRinger()) { CHDiag(@"blocked alert sound %u (hidden ring)", (unsigned)sound); return; }
     %orig;
 }
+// Patterned (call) vibration goes through this private export, not the two above.
+%hookf(void, AudioServicesPlaySystemSoundWithVibration, SystemSoundID sound, id arg, NSDictionary *pattern) {
+    if (gHiddenRinging && CHSilenceRinger()) { CHDiag(@"blocked patterned vibration %u (hidden ring)", (unsigned)sound); return; }
+    %orig;
+}
 
 %end // SpringBoardGroup
 
@@ -570,15 +668,17 @@ static void CHPurgeFromRecents(NSString *number) {
         if (ringing) {
             if (CHSilenceRinger()) CHMuteRinger();     // kills ringtone + ring-mode vibration
             CHReportLogFromSpringBoard();              // what did callservicesd see/do?
+            CHForceDisplayOff();                       // locked: fully black, no Always-On
             CHUpdateIcon(self);
             // safety net: never leave the ringer muted beyond a normal ring
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(60 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{ if (!gHiddenRinging) CHRestoreRinger(); });
+                           dispatch_get_main_queue(), ^{ if (!gHiddenRinging) { CHRestoreRinger(); CHRestoreDisplay(); } });
         }
 
         if (st == 5 || st == 6) {                 // disconnecting / disconnected
             gHiddenRinging = NO;
             CHRestoreRinger();
+            CHRestoreDisplay();
             BOOL answered = (uuid && [gRevealed containsObject:uuid]);
             // Record once per call (status 5 and 6 both arrive): log it, purge it
             // from Phone Recents, and bump the red-glyph counter if it was missed.
@@ -636,7 +736,7 @@ static void CHPurgeFromRecents(NSString *number) {
         gRevealed = [NSSet set];
         CHReload();
         if (!gIsSpringBoard) { gReport |= 1ULL; CHReportPublish(); }   // "loaded" bit for the report
-        CHDiag(@"CallHider v1.5.1 loaded in %@ (springboard=%d, missed=%ld)", gProc, gIsSpringBoard, (long)gMissedCount);
+        CHDiag(@"CallHider v1.6.0 loaded in %@ (springboard=%d, missed=%ld)", gProc, gIsSpringBoard, (long)gMissedCount);
 
         %init(_ungrouped);
         if (gIsSpringBoard) %init(SpringBoardGroup);
