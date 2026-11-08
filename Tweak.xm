@@ -129,6 +129,30 @@ static void CHPersistMissed(void) {
     CFPreferencesAppSynchronize((__bridge CFStringRef)kCHAppID);
 }
 
+// --- callservicesd -> SpringBoard report ---------------------------------------
+// callservicesd can't write our diagnostics file, so it publishes a status word
+// over a Darwin notify state that SpringBoard logs. Bits: 0 = loaded,
+// 8..23 = hidden-list count it could read, 24 = last incoming call matched a
+// hidden caller, 25 = ring-suppression flags were applied to that call.
+#define kCHReportNotify "com.cobradarsh.callhider/csreport"
+static int gReportToken = -1;
+static uint64_t gReport = 0;
+
+static void CHReportPublish(void) {
+    if (gIsSpringBoard) return;
+    if (gReportToken == -1 && notify_register_check(kCHReportNotify, &gReportToken) != NOTIFY_STATUS_OK) return;
+    notify_set_state(gReportToken, gReport);
+    notify_post(kCHReportNotify);
+}
+static void CHReportLogFromSpringBoard(void) {
+    if (!gIsSpringBoard) return;
+    int t; uint64_t s = 0;
+    if (notify_register_check(kCHReportNotify, &t) != NOTIFY_STATUS_OK) return;
+    notify_get_state(t, &s); notify_cancel(t);
+    CHDiag(@"callservicesd report: loaded=%llu hidden=%llu matched=%llu suppressed=%llu",
+           s & 1ULL, (s >> 8) & 0xffffULL, (s >> 24) & 1ULL, (s >> 25) & 1ULL);
+}
+
 static void CHReload(void) {
     CFPreferencesAppSynchronize((__bridge CFStringRef)kCHAppID);
     NSArray *keys = @[kCHEnabled, kCHSilenceRinger, kCHSuppressWake, kCHSuppressUI, kCHTapToAnswer,
@@ -140,6 +164,22 @@ static void CHReload(void) {
         if (v) d[k] = v;
     }
     gPrefs = [d copy];
+    // Outside SpringBoard (e.g. callservicesd) the prefs API may be sandboxed
+    // off; read the plist file directly so the hidden list is still available
+    // where the ring is actually produced.
+    if (!gIsSpringBoard && [gPrefs[kCHHiddenContacts] count] == 0) {
+        NSDictionary *file = [NSDictionary dictionaryWithContentsOfFile:
+            @"/var/mobile/Library/Preferences/com.cobradarsh.callhider.plist"];
+        if ([file isKindOfClass:[NSDictionary class]] && [file[kCHHiddenContacts] isKindOfClass:[NSArray class]]) {
+            NSMutableDictionary *m = [gPrefs mutableCopy];
+            [m addEntriesFromDictionary:file];
+            gPrefs = [m copy];
+        }
+    }
+    if (!gIsSpringBoard) {
+        gReport = (gReport & ~0xffff00ULL) | ((uint64_t)MIN([gPrefs[kCHHiddenContacts] count], (NSUInteger)0xffff) << 8);
+        CHReportPublish();
+    }
     gMissedCount = [gPrefs[kCHMissedCount] integerValue];
     CHDiag(@"prefs reloaded: enabled=%d hidden=%lu missed=%ld", CHEnabled(), (unsigned long)[gPrefs[kCHHiddenContacts] count], (long)gMissedCount);
 }
@@ -315,7 +355,9 @@ static void CHUpdateIcon(id ringingCall) {
 // it when the call ends. We only touch it if the ringer was actually on, so we
 // never un-silence a phone that was already silent.
 static void CHMuteRinger(void) {
-    if (!gIsSpringBoard || gWeMutedRinger || !gSystemRingerOn) return;
+    // Always mute (the old "only if the ringer was observed on" gate skipped
+    // itself after resprings); restore goes back to the last observed state.
+    if (!gIsSpringBoard || gWeMutedRinger) return;
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
             SpringBoard *sb = (SpringBoard *)[UIApplication sharedApplication];
@@ -334,7 +376,7 @@ static void CHRestoreRinger(void) {
         @try {
             SpringBoard *sb = (SpringBoard *)[UIApplication sharedApplication];
             gInOurRinger = YES;
-            [sb _updateRingerState:1 withVisuals:NO updatePreferenceRegister:NO];
+            [sb _updateRingerState:(gSystemRingerOn ? 1 : 0) withVisuals:NO updatePreferenceRegister:NO];
             gInOurRinger = NO;
             gWeMutedRinger = NO;
             CHDiag(@"ringer restored");
@@ -506,13 +548,27 @@ static void CHPurgeFromRecents(NSString *number) {
         NSString *uuid = [self respondsToSelector:@selector(callUUID)] ? self.callUUID : nil;
         CHDiag(@"status=%d incoming=1 handle=%@ -> hidden=%d", st,
                ([self.handle respondsToSelector:@selector(value)]?self.handle.value:@"(nil)") ?: @"(nil)", hidden);
+        if (!gIsSpringBoard) {                    // tell SpringBoard what this process saw
+            gReport = (gReport & ~(3ULL << 24)) | (hidden ? (1ULL << 24) : 0);
+            CHReportPublish();
+        }
         if (!hidden) return;
 
         BOOL ringing = (st == 4);
         gHiddenRinging = ringing;
-        if (CHSilenceRinger() && [self respondsToSelector:@selector(setShouldSuppressRingtone:)]) [(id)self setShouldSuppressRingtone:YES];
+        if (CHSilenceRinger()) {
+            // Flag the call itself (this runs in every process that holds the
+            // call, including callservicesd, the source of truth) and raise the
+            // Continuity "silenced remotely" flag, which reaches the ringtone server.
+            BOOL applied = NO;
+            if ([self respondsToSelector:@selector(setShouldSuppressRingtone:)])    { [(id)self setShouldSuppressRingtone:YES];    applied = YES; }
+            if ([self respondsToSelector:@selector(setRingtoneSuppressedRemotely:)]) { [(id)self setRingtoneSuppressedRemotely:YES]; applied = YES; }
+            if (!gIsSpringBoard) { if (applied) gReport |= (1ULL << 25); CHReportPublish(); }
+            else CHDiag(@"ring-suppression flags set on call (remote=%d)", [self respondsToSelector:@selector(setRingtoneSuppressedRemotely:)]);
+        }
         if (ringing) {
             if (CHSilenceRinger()) CHMuteRinger();     // kills ringtone + ring-mode vibration
+            CHReportLogFromSpringBoard();              // what did callservicesd see/do?
             CHUpdateIcon(self);
             // safety net: never leave the ringer muted beyond a normal ring
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(60 * NSEC_PER_SEC)),
@@ -578,7 +634,8 @@ static void CHPurgeFromRecents(NSString *number) {
         gIsSpringBoard = [gProc isEqualToString:@"SpringBoard"];
         gRevealed = [NSSet set];
         CHReload();
-        CHDiag(@"CallHider v1.4.2 loaded in %@ (springboard=%d, missed=%ld)", gProc, gIsSpringBoard, (long)gMissedCount);
+        if (!gIsSpringBoard) { gReport |= 1ULL; CHReportPublish(); }   // "loaded" bit for the report
+        CHDiag(@"CallHider v1.5.0 loaded in %@ (springboard=%d, missed=%ld)", gProc, gIsSpringBoard, (long)gMissedCount);
 
         %init(_ungrouped);
         if (gIsSpringBoard) %init(SpringBoardGroup);
