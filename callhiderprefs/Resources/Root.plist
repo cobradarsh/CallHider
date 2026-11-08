@@ -47,6 +47,14 @@
         },
         {
             cell = PSSwitchCell;
+            label = "Hide from Phone Recents";
+            key = hideFromRecents;
+            default = 1;
+            defaults = com.cobradarsh.callhider;
+            PostNotification = "com.cobradarsh.callhider/reload";
+        },
+        {
+            cell = PSSwitchCell;
             label = "Tap red icon to answer";
             key = tapToAnswer;
             default = 0;
@@ -97,6 +105,12 @@
             cell = PSButtonCell;
             label = "Clear hidden callers list";
             action = clearHiddenCallers;
+        },
+        {
+            cell = PSLinkCell;
+            label = "Hidden call log";
+            detail = CHCallLogController;
+            isController = 1;
         },
         {
             cell = PSGroupCell;

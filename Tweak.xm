@@ -63,12 +63,27 @@
 @property (nonatomic, retain) BBCommunicationContext *communicationContext;
 @end
 
+// CallHistory (the Phone app's Recents). callservicesd writes entries via
+// -addToCallHistory:; SpringBoard can read them back and delete.
+@interface CHRecentCall : NSObject
+@property (nonatomic, copy) NSString *callerId;
+@property (nonatomic, retain) NSDate *date;
+@end
+@interface CHManager : NSObject
+- (instancetype)init;
+- (void)addToCallHistory:(id)call;
+- (void)addMultipleCallsToCallHistory:(id)calls;
+- (id)fetchRecentCallsSyncWithCoalescing:(BOOL)coalesce;
+- (void)deleteCall:(id)call;
+@end
+
 #pragma mark - State
 
 static BOOL gIsSpringBoard = NO;
 static NSString *gProc = nil;
 static NSDictionary *gPrefs = nil;
 static NSSet<NSString *> *gRevealed;
+static NSString *gLoggedUUID = nil;       // last hidden call written to the log (once per call)
 static volatile BOOL gHiddenRinging = NO;
 static NSInteger gMissedCount = 0;        // persistent "you had a hidden call" count
 static BOOL gSystemRingerOn = YES;        // last ringer state the SYSTEM set
@@ -117,7 +132,8 @@ static void CHPersistMissed(void) {
 static void CHReload(void) {
     CFPreferencesAppSynchronize((__bridge CFStringRef)kCHAppID);
     NSArray *keys = @[kCHEnabled, kCHSilenceRinger, kCHSuppressWake, kCHSuppressUI, kCHTapToAnswer,
-                      kCHHideMissedNotif, kCHIconX, kCHIconY, kCHIconSize, kCHMissedCount, kCHHiddenContacts];
+                      kCHHideMissedNotif, kCHHideFromRecents, kCHIconX, kCHIconY, kCHIconSize,
+                      kCHMissedCount, kCHHiddenContacts];
     NSMutableDictionary *d = [NSMutableDictionary dictionary];
     for (NSString *k in keys) {
         id v = (__bridge_transfer id)CFPreferencesCopyValue((__bridge CFStringRef)k, (__bridge CFStringRef)kCHAppID, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
@@ -326,6 +342,63 @@ static void CHRestoreRinger(void) {
     });
 }
 
+#pragma mark - Phone Recents + hidden-call log
+
+#define CHHideFromRecents() CHBool(kCHHideFromRecents, YES)
+
+// Does a CallHistory entry belong to a hidden caller? (matched by number)
+static BOOL CHRecentCallHidden(id rc) {
+    @try {
+        if (![rc respondsToSelector:@selector(callerId)]) return NO;
+        NSString *num = CHNormalizeNumber([rc callerId]);
+        return num.length > 0 && CHMatchNumbersOrId(nil, num);
+    } @catch (__unused NSException *e) { return NO; }
+}
+
+// Append a hidden call to the persisted log shown in Settings (capped).
+static void CHRecordHiddenCall(NSString *name, NSString *number) {
+    @try {
+        NSArray *cur = (__bridge_transfer NSArray *)CFPreferencesCopyValue((__bridge CFStringRef)kCHCallLog,
+            (__bridge CFStringRef)kCHAppID, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+        NSMutableArray *log = [cur isKindOfClass:[NSArray class]] ? [cur mutableCopy] : [NSMutableArray array];
+        [log addObject:@{ kCHLogName: name ?: @"", kCHLogNumber: number ?: @"",
+                          kCHLogDate: @([[NSDate date] timeIntervalSince1970]) }];
+        while (log.count > kCHCallLogMax) [log removeObjectAtIndex:0];
+        CFPreferencesSetValue((__bridge CFStringRef)kCHCallLog, (__bridge CFArrayRef)log,
+            (__bridge CFStringRef)kCHAppID, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+        CFPreferencesAppSynchronize((__bridge CFStringRef)kCHAppID);
+        CHDiag(@"logged hidden call %@ %@", name ?: @"", number ?: @"");
+    } @catch (__unused NSException *e) {}
+}
+
+// Belt-and-suspenders for Recents: a few seconds after a hidden call ends,
+// delete any entry callservicesd wrote for it. SpringBoard reads our prefs
+// reliably (callservicesd may be sandboxed from them), so this always runs.
+static void CHPurgeFromRecents(NSString *number) {
+    if (!gIsSpringBoard || !CHHideFromRecents()) return;
+    NSString *want = CHNormalizeNumber(number);
+    if (!want.length) return;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4 * NSEC_PER_SEC)),
+                   dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        @try {
+            Class M = objc_getClass("CHManager");
+            if (!M) { CHDiag(@"CHManager not available; cannot purge Recents"); return; }
+            CHManager *mgr = [[M alloc] init];
+            NSArray *recent = [mgr fetchRecentCallsSyncWithCoalescing:NO];
+            NSDate *since = [NSDate dateWithTimeIntervalSinceNow:-180];
+            int n = 0;
+            for (CHRecentCall *rc in recent) {
+                if (![rc respondsToSelector:@selector(callerId)]) continue;
+                NSString *num = CHNormalizeNumber(rc.callerId);
+                if (!num.length || !([num hasSuffix:want] || [want hasSuffix:num])) continue;
+                if (rc.date && [rc.date compare:since] == NSOrderedAscending) continue;   // only the recent one(s)
+                [mgr deleteCall:rc]; n++;
+            }
+            CHDiag(@"purged %d Recents entr%@ for hidden caller", n, n == 1 ? @"y" : @"ies");
+        } @catch (__unused NSException *e) { CHDiag(@"EXCEPTION purging Recents (caught)"); }
+    });
+}
+
 #pragma mark - Hooks
 
 %group SpringBoardGroup
@@ -450,15 +523,51 @@ static void CHRestoreRinger(void) {
             gHiddenRinging = NO;
             CHRestoreRinger();
             BOOL answered = (uuid && [gRevealed containsObject:uuid]);
-            if (!answered) {                      // a MISSED hidden call -> persistent indicator
-                gMissedCount++; CHPersistMissed();
-                CHDiag(@"missed hidden call -> count=%ld", (long)gMissedCount);
+            // Record once per call (status 5 and 6 both arrive): log it, purge it
+            // from Phone Recents, and bump the red-glyph counter if it was missed.
+            if (gIsSpringBoard && uuid && ![gLoggedUUID isEqualToString:uuid]) {
+                gLoggedUUID = uuid;
+                NSString *num  = [self.handle respondsToSelector:@selector(value)] ? self.handle.value : nil;
+                NSString *name = [self respondsToSelector:@selector(displayName)] ? self.displayName : nil;
+                CHRecordHiddenCall(name, num);
+                CHPurgeFromRecents(num);
+                if (!answered) {                  // a MISSED hidden call -> persistent indicator
+                    gMissedCount++; CHPersistMissed();
+                    CHDiag(@"missed hidden call -> count=%ld", (long)gMissedCount);
+                }
             }
             CHUpdateIcon(nil);
         }
     } @catch (__unused NSException *e) { CHDiag(@"EXCEPTION in _handleStatusChange (caught)"); }
 }
 
+%end
+
+// Phone-app Recents: stop hidden callers being written to the call history.
+// callservicesd performs the write; this runs there if it can read our prefs.
+// (SpringBoard's CHPurgeFromRecents covers the case where it can't.)
+%hook CHManager
+- (void)addToCallHistory:(id)call {
+    @try {
+        if (CHEnabled() && CHHideFromRecents() && CHRecentCallHidden(call)) {
+            CHDiag(@"blocked Recents write for hidden caller"); return;
+        }
+    } @catch (__unused NSException *e) {}
+    %orig;
+}
+- (void)addMultipleCallsToCallHistory:(id)calls {
+    @try {
+        if (CHEnabled() && CHHideFromRecents() && [calls isKindOfClass:[NSArray class]]) {
+            NSMutableArray *keep = [NSMutableArray array];
+            for (id c in calls) if (!CHRecentCallHidden(c)) [keep addObject:c];
+            if (keep.count != [(NSArray *)calls count]) {
+                CHDiag(@"filtered %lu hidden caller(s) from a Recents batch", (unsigned long)([(NSArray *)calls count] - keep.count));
+                %orig(keep); return;
+            }
+        }
+    } @catch (__unused NSException *e) {}
+    %orig;
+}
 %end
 
 #pragma mark - Init
@@ -469,7 +578,7 @@ static void CHRestoreRinger(void) {
         gIsSpringBoard = [gProc isEqualToString:@"SpringBoard"];
         gRevealed = [NSSet set];
         CHReload();
-        CHDiag(@"CallHider v1.3.0 loaded in %@ (springboard=%d, missed=%ld)", gProc, gIsSpringBoard, (long)gMissedCount);
+        CHDiag(@"CallHider v1.4.0 loaded in %@ (springboard=%d, missed=%ld)", gProc, gIsSpringBoard, (long)gMissedCount);
 
         %init(_ungrouped);
         if (gIsSpringBoard) %init(SpringBoardGroup);

@@ -6,6 +6,7 @@
 #define kCHTestIconNotify   "com.cobradarsh.callhider/testicon"
 #define kCHClearLogNotify   "com.cobradarsh.callhider/clearlog"
 #define kCHClearMissedNotify "com.cobradarsh.callhider/clearmissed"
+#define kCHClearCallLogNotify "com.cobradarsh.callhider/clearcalllog"
 
 // On-device diagnostics, written by the tweak (SpringBoard) and read by the
 // Settings bundle. /var/mobile is shared between both processes.
@@ -26,6 +27,14 @@
 #define kCHIconY            @"iconY"
 #define kCHIconSize         @"iconSize"         // CGFloat diameter (default 30)
 #define kCHMissedCount      @"missedCount"      // unseen missed hidden calls (persisted)
+#define kCHHideFromRecents  @"hideFromRecents"  // keep hidden calls out of Phone Recents (default YES)
+
+// Hidden-call log shown in Settings: array of { name, number, date(epoch) }, oldest first.
+#define kCHCallLog          @"callLog"
+#define kCHLogName          @"name"
+#define kCHLogNumber        @"number"
+#define kCHLogDate          @"date"
+#define kCHCallLogMax       200
 
 // Hidden callers: array of dictionaries, each:
 //   { "id": <CNContact identifier>, "name": <display>, "numbers": [<normalized digit strings>] }
