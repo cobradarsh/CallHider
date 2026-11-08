@@ -15,6 +15,7 @@
 #import <AudioToolbox/AudioToolbox.h>
 #import <notify.h>
 #import <objc/runtime.h>
+#include <dlfcn.h>
 #import "CHPrefs.h"
 
 #pragma mark - Private interfaces
@@ -623,13 +624,18 @@ static void CHPurgeFromRecents(NSString *number) {
     if (gHiddenRinging && CHSilenceRinger()) { CHDiag(@"blocked alert sound %u (hidden ring)", (unsigned)sound); return; }
     %orig;
 }
-// Patterned (call) vibration goes through this private export, not the two above.
+%end // SpringBoardGroup
+
+// Patterned (call) vibration goes through this private AudioToolbox export, not
+// the two public calls above. It is NOT in the SDK's link stubs, so it lives in
+// its own group and is bound at runtime via dlsym in %ctor — never referenced
+// at link time, and simply skipped if the symbol isn't present.
+%group VibHook
 %hookf(void, AudioServicesPlaySystemSoundWithVibration, SystemSoundID sound, id arg, NSDictionary *pattern) {
     if (gHiddenRinging && CHSilenceRinger()) { CHDiag(@"blocked patterned vibration %u (hidden ring)", (unsigned)sound); return; }
     %orig;
 }
-
-%end // SpringBoardGroup
+%end
 
 %hook TUCall
 
@@ -736,10 +742,16 @@ static void CHPurgeFromRecents(NSString *number) {
         gRevealed = [NSSet set];
         CHReload();
         if (!gIsSpringBoard) { gReport |= 1ULL; CHReportPublish(); }   // "loaded" bit for the report
-        CHDiag(@"CallHider v1.6.0 loaded in %@ (springboard=%d, missed=%ld)", gProc, gIsSpringBoard, (long)gMissedCount);
+        CHDiag(@"CallHider v1.6.1 loaded in %@ (springboard=%d, missed=%ld)", gProc, gIsSpringBoard, (long)gMissedCount);
 
         %init(_ungrouped);
-        if (gIsSpringBoard) %init(SpringBoardGroup);
+        if (gIsSpringBoard) {
+            %init(SpringBoardGroup);
+            // Bind the private vibration export at runtime (it can't be linked).
+            void *vib = dlsym(RTLD_DEFAULT, "AudioServicesPlaySystemSoundWithVibration");
+            if (vib) { %init(VibHook, AudioServicesPlaySystemSoundWithVibration = vib); CHDiag(@"patterned-vibration hook installed"); }
+            else CHDiag(@"patterned-vibration symbol not found; hook skipped");
+        }
 
         int t1; notify_register_dispatch(kCHReloadNotify, &t1, dispatch_get_main_queue(), ^(int t){ CHReload(); CHUpdateIcon(nil); });
         if (gIsSpringBoard) {
