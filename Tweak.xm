@@ -55,14 +55,29 @@
 + (id)acquireWithExplanation:(NSString *)explanation observer:(id)observer attributes:(NSArray *)attributes;
 - (void)invalidate;
 - (BOOL)isAcquired;
+- (BOOL)isActive;
 @end
 @interface SBLockScreenManager : NSObject
 + (instancetype)sharedInstance;
 - (BOOL)isUILocked;
 @end
 
-// Private AudioToolbox export used for patterned (call) vibration — the API my
-// earlier PlaySystemSound/PlayAlertSound hooks did not cover.
+// ToneLibrary. The ringtone AND its vibration are played inside callservicesd by
+// a TLAlert, which asks TLVibrationManager whether to vibrate and asks again
+// whenever the ring-/silent-vibrate "changed" notifications fire (the ones the
+// Sounds settings pane posts). We answer NO for a hidden ring and post those
+// notifications so an alert that is already buzzing re-evaluates and stops.
+@interface TLVibrationManager : NSObject
++ (instancetype)sharedVibrationManager;
+- (BOOL)shouldVibrateOnRing;
+- (BOOL)shouldVibrateOnSilent;
+- (BOOL)shouldVibrateForCurrentRingerSwitchState;
+@end
+#define kVibRingChanged   "com.apple.springboard.ring-vibrate.changed"
+#define kVibSilentChanged "com.apple.springboard.silent-vibrate.changed"
+
+// Private AudioToolbox exports: patterned (call) vibration playback and the stop
+// call. Neither is in the SDK link stubs, so both are bound with dlsym at load.
 extern void AudioServicesPlaySystemSoundWithVibration(SystemSoundID inSystemSoundID, id arg, NSDictionary *vibratePattern);
 // The incoming-call banner; on Dynamic Island devices this is what renders the
 // call pill. We can't stop its creation, but we can keep its view off screen.
@@ -117,9 +132,8 @@ static void CHMuteRinger(void);           // defined below; used from the icon t
 static void CHRestoreRinger(void);
 static void CHRestoreDisplay(void);
 
-// Vibrate settings we temporarily disable during a hidden ring (restored after).
-static id   gOrigRingVibrate = nil, gOrigSilentVibrate = nil;
-static BOOL gVibrateToggled = NO;
+// AudioServicesStopSystemSound, resolved at load (NULL if absent).
+static void (*gStopSystemSound)(SystemSoundID) = NULL;
 // Always-On-Display disable assertion held while a hidden call rings (locked only).
 static id   gAODAssertion = nil;
 
@@ -379,12 +393,23 @@ static void CHUpdateIcon(id ringingCall) {
     });
 }
 
-// The call ringtone (and vibration) is produced by the ringtone SERVER, where
-// our shouldSuppressRingtone hook has no effect — so for a hidden call we
-// temporarily drop the system ringer (proven CallKiller technique) and restore
-// it when the call ends. We only touch it if the ringer was actually on, so we
-// never un-silence a phone that was already silent.
-#define kSBPrefs CFSTR("com.apple.springboard")
+// The call ringtone (and its vibration) is produced in callservicesd by a
+// ToneLibrary alert. For a hidden call we (a) temporarily drop the system ringer
+// (proven CallKiller technique; restored when the call ends), (b) answer NO from
+// TLVibrationManager's should-vibrate getters in every process, and (c) post the
+// vibrate-settings-changed notifications so an alert that is already buzzing
+// re-evaluates against (b) and stops. Nothing in the user's settings is written.
+
+static void CHNudgeVibrationManagers(void) {
+    notify_post(kVibRingChanged);
+    notify_post(kVibSilentChanged);
+}
+// Stop a vibration pattern that is already playing (the ring may have started
+// a beat before our flag was raised).
+static void CHStopVibrationNow(void) {
+    if (!gStopSystemSound) return;
+    @try { gStopSystemSound(kSystemSoundID_Vibrate); CHDiag(@"stopped in-progress vibration"); } @catch (__unused NSException *e) {}
+}
 
 static void CHMuteRinger(void) {
     // Always mute (the old "only if the ringer was observed on" gate skipped
@@ -392,48 +417,28 @@ static void CHMuteRinger(void) {
     if (!gIsSpringBoard || gWeMutedRinger) return;
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
-            // Silent mode still vibrates if "Play Haptics in Silent Mode" is on,
-            // so disable both vibrate settings for the duration of the mute.
-            // Set BEFORE the ringer transition so the alert re-evaluates against them.
-            if (!gVibrateToggled) {
-                gOrigRingVibrate   = CFBridgingRelease(CFPreferencesCopyAppValue(CFSTR("ring-vibrate"),   kSBPrefs));
-                gOrigSilentVibrate = CFBridgingRelease(CFPreferencesCopyAppValue(CFSTR("silent-vibrate"), kSBPrefs));
-                CFPreferencesSetAppValue(CFSTR("ring-vibrate"),   kCFBooleanFalse, kSBPrefs);
-                CFPreferencesSetAppValue(CFSTR("silent-vibrate"), kCFBooleanFalse, kSBPrefs);
-                CFPreferencesAppSynchronize(kSBPrefs);
-                gVibrateToggled = YES;
-                CHDiag(@"vibrate settings disabled (ring was %@, silent was %@)",
-                       gOrigRingVibrate ?: @"default", gOrigSilentVibrate ?: @"default");
-            }
             SpringBoard *sb = (SpringBoard *)[UIApplication sharedApplication];
             if (![sb respondsToSelector:@selector(_updateRingerState:withVisuals:updatePreferenceRegister:)]) return;
             gInOurRinger = YES;
             [sb _updateRingerState:0 withVisuals:NO updatePreferenceRegister:NO];
             gInOurRinger = NO;
             gWeMutedRinger = YES;
+            CHNudgeVibrationManagers();              // re-evaluate vibration against our NO
             CHDiag(@"ringer muted for hidden call");
         } @catch (__unused NSException *e) { gInOurRinger = NO; }
     });
 }
 static void CHRestoreRinger(void) {
-    if (!gIsSpringBoard || (!gWeMutedRinger && !gVibrateToggled)) return;
+    if (!gIsSpringBoard || !gWeMutedRinger) return;
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
-            if (gWeMutedRinger) {
-                SpringBoard *sb = (SpringBoard *)[UIApplication sharedApplication];
-                gInOurRinger = YES;
-                [sb _updateRingerState:(gSystemRingerOn ? 1 : 0) withVisuals:NO updatePreferenceRegister:NO];
-                gInOurRinger = NO;
-                gWeMutedRinger = NO;
-                CHDiag(@"ringer restored");
-            }
-            if (gVibrateToggled) {                    // nil original -> key removed -> back to default
-                CFPreferencesSetAppValue(CFSTR("ring-vibrate"),   (__bridge CFPropertyListRef)gOrigRingVibrate,   kSBPrefs);
-                CFPreferencesSetAppValue(CFSTR("silent-vibrate"), (__bridge CFPropertyListRef)gOrigSilentVibrate, kSBPrefs);
-                CFPreferencesAppSynchronize(kSBPrefs);
-                gVibrateToggled = NO; gOrigRingVibrate = nil; gOrigSilentVibrate = nil;
-                CHDiag(@"vibrate settings restored");
-            }
+            SpringBoard *sb = (SpringBoard *)[UIApplication sharedApplication];
+            gInOurRinger = YES;
+            [sb _updateRingerState:(gSystemRingerOn ? 1 : 0) withVisuals:NO updatePreferenceRegister:NO];
+            gInOurRinger = NO;
+            gWeMutedRinger = NO;
+            CHNudgeVibrationManagers();              // back to the user's real settings
+            CHDiag(@"ringer restored");
         } @catch (__unused NSException *e) { gInOurRinger = NO; }
     });
 }
@@ -464,7 +469,17 @@ static void CHForceDisplayOff(void) {
             id attr = [D disableAlwaysOn];
             if (!attr) { CHDiag(@"AOD: no attribute"); return; }
             gAODAssertion = [A acquireWithExplanation:@"CallHider: hidden call" observer:nil attributes:@[attr]];
-            CHDiag(@"AOD disable assertion %@", gAODAssertion ? @"acquired (display -> off)" : @"FAILED");
+            CHDiag(@"AOD disable assertion %@", gAODAssertion ? @"requested (display -> off)" : @"FAILED");
+            // Acquisition is asynchronous (XPC to the backlight host); report the outcome.
+            id a = gAODAssertion;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                @try {
+                    if (!a || a != gAODAssertion) return;
+                    CHDiag(@"AOD assertion state: acquired=%d active=%d",
+                           [a respondsToSelector:@selector(isAcquired)] ? (int)[a isAcquired] : -1,
+                           [a respondsToSelector:@selector(isActive)]   ? (int)[a isActive]   : -1);
+                } @catch (__unused NSException *e) {}
+            });
         } @catch (__unused NSException *e) { CHDiag(@"EXCEPTION forcing display off (caught)"); }
     });
 }
@@ -613,9 +628,11 @@ static void CHPurgeFromRecents(NSString *number) {
 }
 %end
 
-// Block system sounds / vibration while a hidden call rings. Muting the ringer
-// silences the ringtone but leaves the "vibrate" haptic; this catches the
-// vibration if SpringBoard plays it. Scoped to the hidden ring only.
+%end // SpringBoardGroup
+
+// Block system sounds / simple vibration while a hidden call rings — in EVERY
+// process we load into (callservicesd is where the ring is produced). Scoped to
+// the hidden ring only; these calls have no completion to leave hanging.
 %hookf(void, AudioServicesPlaySystemSound, SystemSoundID sound) {
     if (gHiddenRinging && CHSilenceRinger()) { CHDiag(@"blocked system sound %u (hidden ring)", (unsigned)sound); return; }
     %orig;
@@ -624,7 +641,6 @@ static void CHPurgeFromRecents(NSString *number) {
     if (gHiddenRinging && CHSilenceRinger()) { CHDiag(@"blocked alert sound %u (hidden ring)", (unsigned)sound); return; }
     %orig;
 }
-%end // SpringBoardGroup
 
 // Patterned (call) vibration goes through this private AudioToolbox export, not
 // the two public calls above. It is NOT in the SDK's link stubs, so it lives in
@@ -637,6 +653,25 @@ static void CHPurgeFromRecents(NSString *number) {
 }
 %end
 
+// The decision point itself: the ringtone alert asks these before (and while)
+// vibrating. Installed wherever ToneLibrary is loaded (callservicesd + SpringBoard).
+%group ToneGroup
+%hook TLVibrationManager
+- (BOOL)shouldVibrateOnRing {
+    if (gHiddenRinging && CHSilenceRinger()) { CHDiag(@"vibration manager asked (ring) -> NO"); return NO; }
+    return %orig;
+}
+- (BOOL)shouldVibrateOnSilent {
+    if (gHiddenRinging && CHSilenceRinger()) { CHDiag(@"vibration manager asked (silent) -> NO"); return NO; }
+    return %orig;
+}
+- (BOOL)shouldVibrateForCurrentRingerSwitchState {
+    if (gHiddenRinging && CHSilenceRinger()) { CHDiag(@"vibration manager asked (switch) -> NO"); return NO; }
+    return %orig;
+}
+%end
+%end
+
 %hook TUCall
 
 - (BOOL)shouldSuppressRingtone {
@@ -645,6 +680,13 @@ static void CHPurgeFromRecents(NSString *number) {
 }
 
 - (void)_handleStatusChange {
+    // Raise the flag BEFORE the system reacts to the change, so the first
+    // "should we vibrate?" question for a hidden ring already gets NO.
+    @try {
+        if ([self respondsToSelector:@selector(isIncoming)] && self.isIncoming &&
+            [self respondsToSelector:@selector(callStatus)] && self.callStatus == 4 && CHObjHidden(self))
+            gHiddenRinging = YES;
+    } @catch (__unused NSException *e) {}
     %orig;
     @try {
         if (![self respondsToSelector:@selector(isIncoming)] || !self.isIncoming) return;
@@ -672,7 +714,11 @@ static void CHPurgeFromRecents(NSString *number) {
             else CHDiag(@"ring-suppression flags set on call (remote=%d)", [self respondsToSelector:@selector(setRingtoneSuppressedRemotely:)]);
         }
         if (ringing) {
-            if (CHSilenceRinger()) CHMuteRinger();     // kills ringtone + ring-mode vibration
+            if (CHSilenceRinger()) {
+                CHMuteRinger();                        // SpringBoard: drop the ringer
+                CHStopVibrationNow();                  // kill a pattern already buzzing
+                CHNudgeVibrationManagers();            // make the alert re-ask (-> NO)
+            }
             CHReportLogFromSpringBoard();              // what did callservicesd see/do?
             CHForceDisplayOff();                       // locked: fully black, no Always-On
             CHUpdateIcon(self);
@@ -685,6 +731,7 @@ static void CHPurgeFromRecents(NSString *number) {
             gHiddenRinging = NO;
             CHRestoreRinger();
             CHRestoreDisplay();
+            CHNudgeVibrationManagers();           // vibration decisions back to the user's settings
             BOOL answered = (uuid && [gRevealed containsObject:uuid]);
             // Record once per call (status 5 and 6 both arrive): log it, purge it
             // from Phone Recents, and bump the red-glyph counter if it was missed.
@@ -742,16 +789,18 @@ static void CHPurgeFromRecents(NSString *number) {
         gRevealed = [NSSet set];
         CHReload();
         if (!gIsSpringBoard) { gReport |= 1ULL; CHReportPublish(); }   // "loaded" bit for the report
-        CHDiag(@"CallHider v1.6.1 loaded in %@ (springboard=%d, missed=%ld)", gProc, gIsSpringBoard, (long)gMissedCount);
+        CHDiag(@"CallHider v1.6.2 loaded in %@ (springboard=%d, missed=%ld)", gProc, gIsSpringBoard, (long)gMissedCount);
 
         %init(_ungrouped);
-        if (gIsSpringBoard) {
-            %init(SpringBoardGroup);
-            // Bind the private vibration export at runtime (it can't be linked).
-            void *vib = dlsym(RTLD_DEFAULT, "AudioServicesPlaySystemSoundWithVibration");
-            if (vib) { %init(VibHook, AudioServicesPlaySystemSoundWithVibration = vib); CHDiag(@"patterned-vibration hook installed"); }
-            else CHDiag(@"patterned-vibration symbol not found; hook skipped");
-        }
+        if (gIsSpringBoard) %init(SpringBoardGroup);
+        // Vibration levers go wherever the ring can be produced (callservicesd first).
+        if (objc_getClass("TLVibrationManager")) { %init(ToneGroup); CHDiag(@"ToneLibrary vibration hooks installed"); }
+        else CHDiag(@"ToneLibrary not loaded here; vibration-manager hooks skipped");
+        // Bind the private AudioToolbox exports at runtime (they can't be linked).
+        void *vib = dlsym(RTLD_DEFAULT, "AudioServicesPlaySystemSoundWithVibration");
+        if (vib) { %init(VibHook, AudioServicesPlaySystemSoundWithVibration = vib); CHDiag(@"patterned-vibration hook installed"); }
+        else CHDiag(@"patterned-vibration symbol not found; hook skipped");
+        gStopSystemSound = (void (*)(SystemSoundID))dlsym(RTLD_DEFAULT, "AudioServicesStopSystemSound");
 
         int t1; notify_register_dispatch(kCHReloadNotify, &t1, dispatch_get_main_queue(), ^(int t){ CHReload(); CHUpdateIcon(nil); });
         if (gIsSpringBoard) {
