@@ -1,0 +1,17 @@
+[0;36m==> [1;36mNotice:[m Build may be slow as Theos isn’t using all available CPU cores on this computer. Consider upgrading GNU Make: https://theos.dev/docs/parallel-building
+[1;31m> [1;3;39mMaking all for tweak CallHider…[m
+[0;31m==> [1;39mPreprocessing Tweak.xm…[m
+[0;32m==> [1;39mCompiling Tweak.xm (arm64)…[m
+[0;33m==> [1;39mLinking tweak CallHider (arm64)…[m
+ld: warning: -multiply_defined is obsolete
+ld: warning: Could not find or use auto-linked framework 'CoreAudioTypes': framework 'CoreAudioTypes' not found
+Undefined symbols for architecture arm64:
+  "AudioServicesPlaySystemSoundWithVibration(unsigned int, objc_object*, NSDictionary*)", referenced from:
+      _logosLocalCtor_1dee0aa7(int, char**, char**) in Tweak.xm.81632604.o
+   NOTE: found '_AudioServicesPlaySystemSoundWithVibration' in AudioToolbox.tbd, declaration possibly missing 'extern "C"'
+ld: symbol(s) not found for architecture arm64
+clang++: [0;1;31merror: [0m[1mlinker command failed with exit code 1 (use -v to see invocation)[0m
+make[3]: *** [/Users/runner/work/CallHider/CallHider/.theos/obj/arm64/CallHider.dylib] Error 1
+make[2]: *** [/Users/runner/work/CallHider/CallHider/.theos/obj/arm64/CallHider.dylib] Error 2
+make[1]: *** [internal-library-all_] Error 2
+make: *** [CallHider.all.tweak.variables] Error 2
