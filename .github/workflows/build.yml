@@ -11,7 +11,10 @@ permissions:
 
 jobs:
   build:
-    runs-on: macos-14
+    # Intel runner: the arm64 macOS pool is capacity-constrained and GitHub
+    # cancels its jobs under pressure (two CallHider runs in a row were
+    # cancelled). Xcode's toolchain cross-compiles arm64/arm64e fine here.
+    runs-on: macos-15-intel
     steps:
       - name: Checkout
         uses: actions/checkout@v4
