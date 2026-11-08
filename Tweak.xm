@@ -673,6 +673,24 @@ static void CHPurgeFromRecents(NSString *number) {
 // If these private selectors differ on this iOS, the hooks simply never install
 // (the diagnostics below say which one fired).
 %hook SBInCallPresentationSession
+// The central dispatcher for EVERY in-call presentation: mode 0 = banner (which
+// the Dynamic Island hosts as an element), 1 = non-modal (the Island "Jindo"
+// pill), 2/3 = full screen / transient overlay. It is reached from the request
+// server (already covered by PRES-HOOK) AND from the InCallService scene action
+// (-_handleRequestInCallPresentationModeAction:) that bypasses PRES-HOOK — the
+// path that still put hidden calls in the Island. Present since iOS 15. The
+// completion is (BOOL success); answering YES keeps the client from retrying
+// with another mode.
+- (void)_performPresentationWithRequestedPresentationMode:(long long)mode isUserInitiated:(BOOL)userInitiated
+                                                  animated:(BOOL)animated analyticsSource:(id)source
+                                                completion:(void (^)(BOOL))completion {
+    if (CHSuppressUI() && gHiddenCallActive) {
+        CHDiag(@"Island/UI: blocked in-call presentation mode=%lld (hidden call)", mode);
+        @try { if (completion) completion(YES); } @catch (__unused NSException *e) {}
+        return;
+    }
+    %orig;
+}
 - (void)_createJindoElementIfNeeded {
     if (CHSuppressUI() && gHiddenCallActive) { CHDiag(@"Island: blocked Jindo element creation (hidden call)"); return; }
     %orig;
@@ -857,7 +875,7 @@ static void CHPurgeFromRecents(NSString *number) {
         gRevealed = [NSSet set];
         CHReload();
         if (!gIsSpringBoard) { gReport |= 1ULL; CHReportPublish(); }   // "loaded" bit for the report
-        CHDiag(@"CallHider v1.7.0 loaded in %@ (springboard=%d, missed=%ld)", gProc, gIsSpringBoard, (long)gMissedCount);
+        CHDiag(@"CallHider v1.7.1 loaded in %@ (springboard=%d, missed=%ld)", gProc, gIsSpringBoard, (long)gMissedCount);
 
         %init(_ungrouped);
         if (gIsSpringBoard) %init(SpringBoardGroup);
