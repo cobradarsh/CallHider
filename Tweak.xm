@@ -30,6 +30,7 @@
 @property (nonatomic, readonly, copy) NSString *displayName;
 @property (nonatomic, readonly, copy) NSString *callUUID;
 - (void)setShouldSuppressRingtone:(BOOL)v;
+- (void)setRingtoneSuppressedRemotely:(BOOL)v;   // Continuity "silenced from another device"; reaches the ringtone server
 @end
 @interface TUCallCenter : NSObject
 + (instancetype)sharedInstance;
@@ -635,7 +636,7 @@ static void CHPurgeFromRecents(NSString *number) {
         gRevealed = [NSSet set];
         CHReload();
         if (!gIsSpringBoard) { gReport |= 1ULL; CHReportPublish(); }   // "loaded" bit for the report
-        CHDiag(@"CallHider v1.5.0 loaded in %@ (springboard=%d, missed=%ld)", gProc, gIsSpringBoard, (long)gMissedCount);
+        CHDiag(@"CallHider v1.5.1 loaded in %@ (springboard=%d, missed=%ld)", gProc, gIsSpringBoard, (long)gMissedCount);
 
         %init(_ungrouped);
         if (gIsSpringBoard) %init(SpringBoardGroup);

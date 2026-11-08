@@ -37,11 +37,11 @@
     _table.delegate = self;
     [self.view addSubview:_table];
 
-    self.navigationItem.rightBarButtonItem =
-        [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemAdd
-                                                      target:self action:@selector(addTapped)];
-    // Edit toggles delete controls on each row; tapping Done saves the result.
-    self.navigationItem.leftBarButtonItem = self.editButtonItem;
+    // Add and Edit both live on the RIGHT. Putting Edit in the left slot replaced
+    // the Back button and trapped the user on this screen (1.3.0 bug).
+    UIBarButtonItem *add = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemAdd
+                                                                        target:self action:@selector(addTapped)];
+    self.navigationItem.rightBarButtonItems = @[ add, self.editButtonItem ];
 }
 
 // editButtonItem calls this; drive the table's editing mode so per-row delete
