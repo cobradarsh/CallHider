@@ -4,8 +4,10 @@
 //   * Ringtone silenced via -shouldSuppressRingtone (safe getter/setter).
 //   * Screen wake blocked via SBBacklightController while a hidden call rings.
 //   * On-screen call UI suppressed by swallowing the SBInCallPresentationManager
-//     presentation request (PRES-HOOK, proven to fire) — completion is still
-//     called so the client isn't left hanging. Gated by "Hide on-screen call UI".
+//     presentation request (PRES-HOOK, proven to fire) — the request is answered
+//     with an error (v1.7.2; it used to be answered "presented", which left
+//     InCallService waiting for a scene that never came — see PRES-HOOK below).
+//     Gated by "Hide on-screen call UI".
 //   * Missed-call lockscreen notification dropped at BBServer for hidden callers
 //     (matched by the bulletin's BBContact cnContactIdentifier / handle).
 //   * Small red phone glyph indicator that PERSISTS after a missed hidden call
@@ -16,6 +18,8 @@
 #import <notify.h>
 #import <objc/runtime.h>
 #include <dlfcn.h>
+#include <signal.h>
+#include <errno.h>
 #import "CHPrefs.h"
 
 #pragma mark - Private interfaces
@@ -36,9 +40,22 @@
 @end
 @interface TUCallCenter : NSObject
 + (instancetype)sharedInstance;
+@property (nonatomic, readonly, copy) NSArray *currentCalls;
 - (void)answerCall:(TUCall *)call;
 - (void)disconnectCall:(TUCall *)call;
 - (void)disconnectAllCalls;
+@end
+
+// SpringBoard's handle on an app process, used to find InCallService's pid.
+@interface SBApplicationProcessState : NSObject
+@property (nonatomic, readonly) int pid;
+@end
+@interface SBApplication : NSObject
+@property (nonatomic, readonly) SBApplicationProcessState *processState;
+@end
+@interface SBApplicationController : NSObject
++ (instancetype)sharedInstance;
+- (SBApplication *)applicationWithBundleIdentifier:(NSString *)bundleIdentifier;
 @end
 
 // SpringBoard's in-call presentation session: on Dynamic Island devices it
@@ -139,6 +156,7 @@ static NSInteger gMissedCount = 0;        // persistent "you had a hidden call" 
 static BOOL gSystemRingerOn = YES;        // last ringer state the SYSTEM set
 static BOOL gWeMutedRinger = NO;          // we lowered the ringer for a hidden call
 static BOOL gInOurRinger = NO;            // guard so our own calls don't self-record
+static volatile BOOL gBlockedPresentation = NO; // a presentation was swallowed below PRES-HOOK during this hidden call
 
 static void CHMuteRinger(void);           // defined below; used from the icon tap handler
 static void CHRestoreRinger(void);
@@ -592,14 +610,73 @@ static void CHPurgeFromRecents(NSString *number) {
 
 #pragma mark - Hooks
 
+// The answer to a presentation request we swallow. It has to be an error, not
+// nil: InCallService marks its call scene "pending" when it asks SpringBoard to
+// present and clears that mark only when the scene connects or the answer
+// carries an error ("Failed to get call scene with error: ... Invalidating").
+// Answering nil ("presented") while creating no scene left the mark set for as
+// long as that InCallService process lived, so it never asked again and every
+// later call, hidden or not, rang with no call UI.
+static NSError *CHPresentationDeclinedError(void) {
+    return [NSError errorWithDomain:kCHAppID code:1
+                           userInfo:@{ NSLocalizedDescriptionKey: @"CallHider: call UI suppressed for a hidden caller" }];
+}
+
+// --- InCallService reset (only for the one case we cannot answer honestly) ----
+// The request above can be declined with an error. A presentation swallowed one
+// level down, in SBInCallPresentationSession, cannot: if that presentation was
+// the first one of a request that slipped past PRES-HOOK (InCallService asked
+// before SpringBoard had seen the call, so the hidden flag was not up yet),
+// SpringBoard still answers the request "presented" and InCallService is back
+// to waiting for a scene that never connects. For that case only, restart
+// InCallService once the hidden call is over and no call is live. It is just
+// the call UI process and is relaunched for the next call.
+static pid_t CHInCallServicePID(void) {
+    @try {
+        SBApplicationController *controller = [(id)objc_getClass("SBApplicationController") sharedInstance];
+        if (![controller respondsToSelector:@selector(applicationWithBundleIdentifier:)]) return 0;
+        SBApplication *app = [controller applicationWithBundleIdentifier:@"com.apple.InCallService"];
+        SBApplicationProcessState *state = [app respondsToSelector:@selector(processState)] ? app.processState : nil;
+        return [state respondsToSelector:@selector(pid)] ? state.pid : 0;
+    } @catch (__unused NSException *e) { return 0; }
+}
+
+// YES unless we can positively see that no call is ringing or connected.
+static BOOL CHAnyLiveCall(void) {
+    @try {
+        TUCallCenter *cc = [objc_getClass("TUCallCenter") sharedInstance];
+        if (![cc respondsToSelector:@selector(currentCalls)]) return YES;
+        for (TUCall *call in cc.currentCalls) {
+            if (![call respondsToSelector:@selector(callStatus)]) return YES;
+            int st = call.callStatus;
+            if (st != 5 && st != 6) return YES;      // anything but disconnecting / disconnected
+        }
+        return NO;
+    } @catch (__unused NSException *e) { return YES; }
+}
+
+static void CHResetInCallServiceWhenIdle(void) {
+    if (!gIsSpringBoard) return;
+    // Let the ended call finish tearing down, and never touch a call in progress.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        @try {
+            if (CHAnyLiveCall()) { CHDiag(@"InCallService reset skipped: a call is live"); return; }
+            pid_t pid = CHInCallServicePID();
+            if (pid <= 0) { CHDiag(@"InCallService reset not needed: it is not running"); return; }
+            if (kill(pid, SIGKILL) == 0 || errno == ESRCH) CHDiag(@"InCallService restarted (pid %d) after a blocked presentation", pid);
+            else CHDiag(@"InCallService reset FAILED: kill(%d) errno %d", pid, errno);
+        } @catch (__unused NSException *e) {}
+    });
+}
+
 %group SpringBoardGroup
 
 %hook SBInCallPresentationManager
 - (void)inCallPresentationRequestServer:(id)server clientWithIdentifier:(id)ident
-       requestsPresentationWithConfiguration:(id)config completion:(void (^)(id))completion {
+       requestsPresentationWithConfiguration:(id)config completion:(void (^)(NSError *))completion {
     if (CHSuppressUI() && gHiddenCallActive) {
-        CHDiag(@"PRES-HOOK suppressed (hidden call active)");
-        @try { if (completion) completion(nil); } @catch (__unused NSException *e) {}
+        CHDiag(@"PRES-HOOK suppressed (hidden call active) -> declined with an error");
+        @try { if (completion) completion(CHPresentationDeclinedError()); } @catch (__unused NSException *e) {}
         return;                       // don't present the call UI
     }
     CHDiag(@"PRES-HOOK passthrough");
@@ -686,6 +763,7 @@ static void CHPurgeFromRecents(NSString *number) {
                                                 completion:(void (^)(BOOL))completion {
     if (CHSuppressUI() && gHiddenCallActive) {
         CHDiag(@"Island/UI: blocked in-call presentation mode=%lld (hidden call)", mode);
+        gBlockedPresentation = YES;   // may leave InCallService waiting; see CHResetInCallServiceWhenIdle
         @try { if (completion) completion(YES); } @catch (__unused NSException *e) {}
         return;
     }
@@ -818,6 +896,10 @@ static void CHPurgeFromRecents(NSString *number) {
             CHRestoreRinger();
             CHRestoreDisplay();
             CHNudgeVibrationManagers();           // vibration decisions back to the user's settings
+            if (gIsSpringBoard && gBlockedPresentation) {   // status 5 and 6 both arrive: schedule once
+                gBlockedPresentation = NO;
+                CHResetInCallServiceWhenIdle();
+            }
             BOOL answered = (uuid && [gRevealed containsObject:uuid]);
             // Record once per call (status 5 and 6 both arrive): log it, purge it
             // from Phone Recents, and bump the red-glyph counter if it was missed.
@@ -875,7 +957,7 @@ static void CHPurgeFromRecents(NSString *number) {
         gRevealed = [NSSet set];
         CHReload();
         if (!gIsSpringBoard) { gReport |= 1ULL; CHReportPublish(); }   // "loaded" bit for the report
-        CHDiag(@"CallHider v1.7.1 loaded in %@ (springboard=%d, missed=%ld)", gProc, gIsSpringBoard, (long)gMissedCount);
+        CHDiag(@"CallHider v1.7.2 loaded in %@ (springboard=%d, missed=%ld)", gProc, gIsSpringBoard, (long)gMissedCount);
 
         %init(_ungrouped);
         if (gIsSpringBoard) %init(SpringBoardGroup);
