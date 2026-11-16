@@ -8,6 +8,9 @@
 //     with an error (v1.7.2; it used to be answered "presented", which left
 //     InCallService waiting for a scene that never came — see PRES-HOOK below).
 //     Gated by "Hide on-screen call UI".
+//   * Dynamic Island: SpringBoard's own "call ringing" pill (the phone glyph it
+//     shows when a call rings with no call UI up) is held off with a pill
+//     suppression assertion while a hidden call rings (v1.7.3).
 //   * Missed-call lockscreen notification dropped at BBServer for hidden callers
 //     (matched by the bulletin's BBContact cnContactIdentifier / handle).
 //   * Small red phone glyph indicator that PERSISTS after a missed hidden call
@@ -66,8 +69,15 @@
 @interface SBBacklightController : NSObject
 - (void)turnOnScreenFullyWithBacklightSource:(long long)source;
 @end
+// The Dynamic Island's controller. Besides hosting call scenes, the Island shows
+// the old status-bar "pills" (SBSystemApertureStatusBarPillElement), and the
+// controller hands out assertions that keep chosen pills away.
+@interface SBSystemApertureController : NSObject
+- (id)acquireSuppressionAssertionForStatusBarStyleOverrides:(unsigned long long)overrides reason:(NSString *)reason;
+@end
 @interface SpringBoard : UIApplication
 - (void)_updateRingerState:(int)arg1 withVisuals:(BOOL)arg2 updatePreferenceRegister:(BOOL)arg3;
+- (SBSystemApertureController *)systemApertureControllerForMainDisplay;
 @end
 
 // BacklightServices: the system's own way to disable Always-On (used face-down,
@@ -166,6 +176,8 @@ static void CHRestoreDisplay(void);
 static void (*gStopSystemSound)(SystemSoundID) = NULL;
 // Always-On-Display disable assertion held while a hidden call rings (locked only).
 static id   gAODAssertion = nil;
+// Dynamic Island "call ringing" pill suppression held while a hidden call rings.
+static id   gRingPillAssertion = nil;
 
 #pragma mark - Diagnostics
 
@@ -551,6 +563,48 @@ static void CHRestoreDisplay(void) {
     });
 }
 
+#pragma mark - Dynamic Island "call ringing" pill
+
+// While a call rings with no call UI on screen, SpringBoard itself puts a small
+// phone glyph in the Dynamic Island: the status-bar "call ringing" pill
+// (UIStatusBarStyleOverrideCallRinging, drawn by SBSystemApertureStatusBarPillElement
+// as phone.down.fill). A hidden call is exactly that case, and the pill is not
+// part of the in-call presentation, so none of the presentation hooks see it.
+// SpringBoard hides these pills through suppression assertions (it takes one
+// itself while a call's own Island element is up); hold one for the two ringing
+// overrides while a hidden call rings.
+#define kCHRingingStyleOverrides 0x18000000ULL   // CallRinging (1<<27) | VideoConferenceRinging (1<<28)
+
+static void CHSuppressIslandRingPill(void) {
+    if (!gIsSpringBoard || !CHSuppressUI()) return;
+    dispatch_async(dispatch_get_main_queue(), ^{      // the pill provider is main-thread only
+        @try {
+            if (gRingPillAssertion || !gHiddenRinging) return;
+            SpringBoard *sb = (SpringBoard *)[UIApplication sharedApplication];
+            SBSystemApertureController *island = [sb respondsToSelector:@selector(systemApertureControllerForMainDisplay)]
+                                               ? [sb systemApertureControllerForMainDisplay] : nil;
+            if (![island respondsToSelector:@selector(acquireSuppressionAssertionForStatusBarStyleOverrides:reason:)]) {
+                CHDiag(@"Island: no pill suppression on this device/iOS; ringing pill not hidden");
+                return;
+            }
+            gRingPillAssertion = [island acquireSuppressionAssertionForStatusBarStyleOverrides:kCHRingingStyleOverrides
+                                                                                      reason:@"CallHider hidden call"];
+            CHDiag(@"Island: ringing pill suppression %@", gRingPillAssertion ? @"acquired" : @"NOT acquired");
+        } @catch (__unused NSException *e) { CHDiag(@"EXCEPTION suppressing the Island ringing pill (caught)"); }
+    });
+}
+static void CHRestoreIslandRingPill(void) {
+    if (!gIsSpringBoard) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            if (!gRingPillAssertion || gHiddenRinging) return;   // nothing held, or a hidden call is ringing (again)
+            id a = gRingPillAssertion; gRingPillAssertion = nil;
+            if ([a respondsToSelector:@selector(invalidate)]) [a invalidate];
+            CHDiag(@"Island: ringing pill suppression released");
+        } @catch (__unused NSException *e) {}
+    });
+}
+
 #pragma mark - Phone Recents + hidden-call log
 
 #define CHHideFromRecents() CHBool(kCHHideFromRecents, YES)
@@ -883,10 +937,13 @@ static void CHResetInCallServiceWhenIdle(void) {
             }
             CHReportLogFromSpringBoard();              // what did callservicesd see/do?
             CHForceDisplayOff();                       // locked: fully black, no Always-On
+            CHSuppressIslandRingPill();                // no "call ringing" glyph in the Dynamic Island
             CHUpdateIcon(self);
             // safety net: never leave the ringer muted beyond a normal ring
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(60 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{ if (!gHiddenRinging) { CHRestoreRinger(); CHRestoreDisplay(); } });
+        } else {
+            CHRestoreIslandRingPill();                 // answered or over: nothing is ringing any more
         }
 
         if (st == 5 || st == 6) {                 // disconnecting / disconnected
@@ -957,7 +1014,7 @@ static void CHResetInCallServiceWhenIdle(void) {
         gRevealed = [NSSet set];
         CHReload();
         if (!gIsSpringBoard) { gReport |= 1ULL; CHReportPublish(); }   // "loaded" bit for the report
-        CHDiag(@"CallHider v1.7.2 loaded in %@ (springboard=%d, missed=%ld)", gProc, gIsSpringBoard, (long)gMissedCount);
+        CHDiag(@"CallHider v1.7.3 loaded in %@ (springboard=%d, missed=%ld)", gProc, gIsSpringBoard, (long)gMissedCount);
 
         %init(_ungrouped);
         if (gIsSpringBoard) %init(SpringBoardGroup);
