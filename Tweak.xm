@@ -11,6 +11,8 @@
 //   * Dynamic Island: SpringBoard's own "call ringing" pill (the phone glyph it
 //     shows when a call rings with no call UI up) is held off with a pill
 //     suppression assertion while a hidden call rings (v1.7.3).
+//   * v1.7.4: the patterned-vibration hook takes its extra arguments as raw pointers (they are not always
+//     objects; retaining them crashed SpringBoard on a system alert sound).
 //   * Missed-call lockscreen notification dropped at BBServer for hidden callers
 //     (matched by the bulletin's BBContact cnContactIdentifier / handle).
 //   * Small red phone glyph indicator that PERSISTS after a missed hidden call
@@ -114,7 +116,9 @@
 
 // Private AudioToolbox exports: patterned (call) vibration playback and the stop
 // call. Neither is in the SDK link stubs, so both are bound with dlsym at load.
-extern void AudioServicesPlaySystemSoundWithVibration(SystemSoundID inSystemSoundID, id arg, NSDictionary *vibratePattern);
+// Its 2nd and 3rd arguments are NOT always objects: SpringBoard's own alert sounds reach this export with a
+// plain 0x1 in both. They are only passed through here, so they stay raw pointers that ARC never touches.
+extern void AudioServicesPlaySystemSoundWithVibration(SystemSoundID inSystemSoundID, void *arg, void *vibratePattern);
 // The incoming-call banner; on Dynamic Island devices this is what renders the
 // call pill. We can't stop its creation, but we can keep its view off screen.
 @interface SBInCallBannerPresentableViewController : UIViewController
@@ -855,8 +859,13 @@ static void CHResetInCallServiceWhenIdle(void) {
 // the two public calls above. It is NOT in the SDK's link stubs, so it lives in
 // its own group and is bound at runtime via dlsym in %ctor — never referenced
 // at link time, and simply skipped if the symbol isn't present.
+//
+// v1.7.4: `arg` and `pattern` were typed `id` / `NSDictionary *`, so ARC retained both on entry. When SpringBoard
+// played an ordinary alert sound (-[SBSoundController _playSystemSound:], here for the alert shown on plugging
+// into a computer) they held 0x1, and objc_retain(0x1) crashed SpringBoard into safe mode. Raw pointers now:
+// nothing here needs them as objects, they only go on to %orig.
 %group VibHook
-%hookf(void, AudioServicesPlaySystemSoundWithVibration, SystemSoundID sound, id arg, NSDictionary *pattern) {
+%hookf(void, AudioServicesPlaySystemSoundWithVibration, SystemSoundID sound, void *arg, void *pattern) {
     if (gHiddenRinging && CHSilenceRinger()) { CHDiag(@"blocked patterned vibration %u (hidden ring)", (unsigned)sound); return; }
     %orig;
 }
@@ -1014,7 +1023,7 @@ static void CHResetInCallServiceWhenIdle(void) {
         gRevealed = [NSSet set];
         CHReload();
         if (!gIsSpringBoard) { gReport |= 1ULL; CHReportPublish(); }   // "loaded" bit for the report
-        CHDiag(@"CallHider v1.7.3 loaded in %@ (springboard=%d, missed=%ld)", gProc, gIsSpringBoard, (long)gMissedCount);
+        CHDiag(@"CallHider v1.7.4 loaded in %@ (springboard=%d, missed=%ld)", gProc, gIsSpringBoard, (long)gMissedCount);
 
         %init(_ungrouped);
         if (gIsSpringBoard) %init(SpringBoardGroup);
